@@ -192,8 +192,9 @@ def evaluate(
             audio = audio.unsqueeze(1)
         audio = audio.to(device)
 
-        out = model(audio)
-        x_hat = out["x_hat"]
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            out = model(audio)
+            x_hat = out["x_hat"]
 
         # SNR
         snr_total += compute_snr(x_hat, audio)
@@ -280,6 +281,12 @@ def train(args: DictConfig) -> None:
     print(f"  Decoder: {count_parameters(model.decoder):,}")
     print(f"  Total stride: {model.total_stride}")
 
+    # ── torch.compile ────────────────────────────────────────
+    use_compile = bool(args.get("use_compile", False))
+    if use_compile and hasattr(torch, "compile"):
+        print("  Compiling model with torch.compile...")
+        model = torch.compile(model)
+
     # ── Discriminator ────────────────────────────────────────
     adv_enable = bool(args.adv_enable)
     disc = None
@@ -291,6 +298,8 @@ def train(args: DictConfig) -> None:
             filters=int(args.get("disc_filters", 32)),
         ).to(device)
         print(f"Discriminator parameters: {count_parameters(disc):,}")
+        if use_compile and hasattr(torch, "compile"):
+            disc = torch.compile(disc)
 
     # ── Loss functions ───────────────────────────────────────
     mrstft_loss_fn = MultiResolutionSTFTLoss(
@@ -425,32 +434,32 @@ def train(args: DictConfig) -> None:
 
             # ── Generator step ───────────────────────────────
             model.set_step(global_step)
-            out = model(audio)
-            x_hat = out["x_hat"]
-            reg_loss = out["reg_loss"]
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                out = model(audio)
+                x_hat = out["x_hat"]
+                reg_loss = out["reg_loss"]
 
-            recon_losses = compute_reconstruction_loss(
-                audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
-                l1_weight=l1_weight, stft_weight=stft_weight, mel_weight=mel_weight,
-            )
-            g_loss = recon_losses["total"]
+                recon_losses = compute_reconstruction_loss(
+                    audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
+                    l1_weight=l1_weight, stft_weight=stft_weight, mel_weight=mel_weight,
+                )
+                g_loss = recon_losses["total"]
 
-            # Adversarial losses (Phase 2)
-            adv_g_loss_val = 0.0
-            fm_loss_val = 0.0
-            d_loss_val = 0.0
+                # Adversarial losses (Phase 2)
+                adv_g_loss_val = 0.0
+                fm_loss_val = 0.0
+                d_loss_val = 0.0
 
-            if use_adv and disc is not None:
-                # Generator adversarial loss
-                fake_logits, fake_features = disc(x_hat)
-                with torch.no_grad():
-                    _, real_features = disc(audio)
+                if use_adv and disc is not None:
+                    fake_logits, fake_features = disc(x_hat)
+                    with torch.no_grad():
+                        _, real_features = disc(audio)
 
-                g_adv = generator_loss(fake_logits)
-                fm_loss = feature_matching_loss(real_features, fake_features)
-                g_loss = g_loss + adv_g_weight * g_adv + adv_fm_weight * fm_loss
-                adv_g_loss_val = g_adv.item()
-                fm_loss_val = fm_loss.item()
+                    g_adv = generator_loss(fake_logits)
+                    fm_loss = feature_matching_loss(real_features, fake_features)
+                    g_loss = g_loss + adv_g_weight * g_adv + adv_fm_weight * fm_loss
+                    adv_g_loss_val = g_adv.item()
+                    fm_loss_val = fm_loss.item()
 
             # NaN/Inf check
             if not torch.isfinite(g_loss):
@@ -481,11 +490,13 @@ def train(args: DictConfig) -> None:
             # ── Discriminator step (Phase 2) ─────────────────
             if use_adv and disc is not None and d_optimizer is not None:
                 with torch.no_grad():
-                    x_hat_d = model(audio)["x_hat"]
+                    with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                        x_hat_d = model(audio)["x_hat"]
 
-                real_logits, _ = disc(audio)
-                fake_logits, _ = disc(x_hat_d.detach())
-                d_loss = discriminator_loss(real_logits, fake_logits)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    real_logits, _ = disc(audio)
+                    fake_logits, _ = disc(x_hat_d.detach())
+                    d_loss = discriminator_loss(real_logits, fake_logits)
 
                 if torch.isfinite(d_loss):
                     (d_loss / grad_accum_steps).backward()

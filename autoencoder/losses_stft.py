@@ -6,12 +6,10 @@ import torch.nn.functional as F
 
 
 class STFTLoss(nn.Module):
-    """单分辨率 STFT 损失
+    """单分辨率 STFT 损失 (DAC/Stable Audio style)
     
-    支持:
-    - Spectral convergence + log magnitude (原有)
-    - Complex loss: real/imag L1 (隐式相位约束)
-    - 频带加权: 指定频率范围加权 (如 2-6kHz)
+    L1(magnitude) + L1(log(magnitude^2))
+    不使用 spectral convergence（主流做法）。
     """
     
     def __init__(
@@ -20,26 +18,16 @@ class STFTLoss(nn.Module):
         hop_size: int = 256,
         win_size: int = 1024,
         sr: int = 24000,
-        complex_weight: float = 0.0,
-        band_boost_range: tuple = None,
-        band_boost_factor: float = 1.0,
+        log_pow: float = 2.0,
+        clamp_eps: float = 1e-5,
     ):
         super().__init__()
         self.fft_size = fft_size
         self.hop_size = hop_size
         self.win_size = win_size
-        self.complex_weight = complex_weight
+        self.log_pow = log_pow
+        self.clamp_eps = clamp_eps
         self.register_buffer("window", torch.hann_window(win_size))
-        
-        # 频带加权 mask: [n_freq, 1]
-        n_freq = fft_size // 2 + 1
-        freq_weight = torch.ones(n_freq, 1)
-        if band_boost_range is not None and band_boost_factor > 1.0:
-            lo_hz, hi_hz = band_boost_range
-            bin_lo = int(lo_hz / (sr / fft_size))
-            bin_hi = min(int(hi_hz / (sr / fft_size)), n_freq)
-            freq_weight[bin_lo:bin_hi] = band_boost_factor
-        self.register_buffer("freq_weight", freq_weight)
         
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
@@ -47,7 +35,6 @@ class STFTLoss(nn.Module):
             x: [B, 1, T] 预测音频
             y: [B, 1, T] 目标音频
         """
-        # 强制 FP32: torch.stft 在 FP16 下中间值易溢出
         x = x.squeeze(1).float()
         y = y.squeeze(1).float()
         
@@ -63,32 +50,20 @@ class STFTLoss(nn.Module):
         x_mag = torch.abs(x_stft)
         y_mag = torch.abs(y_stft)
         
-        # 频带加权
-        w = self.freq_weight  # [n_freq, 1]
-        x_mag_w = x_mag * w
-        y_mag_w = y_mag * w
+        # Linear magnitude L1
+        mag_loss = F.l1_loss(x_mag, y_mag)
         
-        # Spectral convergence loss (加权) — detach denominator to stabilize gradients
-        sc_loss = torch.norm(y_mag_w - x_mag_w, p="fro") / (torch.norm(y_mag_w, p="fro").detach() + 1e-4)
+        # Log magnitude L1 (with power compression, matching DAC)
+        log_loss = F.l1_loss(
+            torch.log(x_mag.clamp(min=self.clamp_eps).pow(self.log_pow)),
+            torch.log(y_mag.clamp(min=self.clamp_eps).pow(self.log_pow)),
+        )
         
-        # Log magnitude loss (加权)  [eps=1e-4: FP16 safe, 1e-8 underflows to 0]
-        log_loss = F.l1_loss(torch.log(x_mag_w + 1e-4), torch.log(y_mag_w + 1e-4))
-        
-        loss = sc_loss + log_loss
-        
-        # Complex loss: real/imag L1 (隐式相位约束)
-        if self.complex_weight > 0:
-            complex_loss = (
-                F.l1_loss(x_stft.real * w, y_stft.real * w)
-                + F.l1_loss(x_stft.imag * w, y_stft.imag * w)
-            )
-            loss = loss + self.complex_weight * complex_loss
-        
-        return loss
+        return mag_loss + log_loss
 
 
 class MultiResolutionSTFTLoss(nn.Module):
-    """多分辨率 STFT 损失"""
+    """多分辨率 STFT 损失 (DAC/Stable Audio style)"""
     
     def __init__(
         self,
@@ -96,19 +71,10 @@ class MultiResolutionSTFTLoss(nn.Module):
         hop_sizes: list = [128, 256, 512],
         win_sizes: list = [512, 1024, 2048],
         sr: int = 24000,
-        complex_weight: float = 0.0,
-        band_boost_range: tuple = None,
-        band_boost_factor: float = 1.0,
     ):
         super().__init__()
         self.stft_losses = nn.ModuleList([
-            STFTLoss(
-                fft_size, hop_size, win_size,
-                sr=sr,
-                complex_weight=complex_weight,
-                band_boost_range=band_boost_range,
-                band_boost_factor=band_boost_factor,
-            )
+            STFTLoss(fft_size, hop_size, win_size, sr=sr)
             for fft_size, hop_size, win_size in zip(fft_sizes, hop_sizes, win_sizes)
         ])
         

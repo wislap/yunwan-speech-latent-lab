@@ -26,14 +26,14 @@ train:
 
   # ─── Loss weights ─────────────────────────────────────────
   l1_time_weight: 1.0
-  stft_weight: 0.5
+  stft_weight: 1.0
   mel_weight: 1.0
   adv_g_weight: 0.5
   adv_fm_weight: 2.0
 
   # ─── Training ─────────────────────────────────────────────
-  batch_size: 4
-  grad_accum_steps: 4
+  batch_size: 8
+  grad_accum_steps: 2
   lr: 3.0e-4
   scheduler: cosine
   grad_clip: 0.5
