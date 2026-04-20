@@ -39,42 +39,32 @@ def pixel_shuffle_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
 
 
 class DownsampleShortcut(nn.Module):
-    """Non-parametric downsample: pixel_unshuffle + adaptive grouped mean."""
+    """Non-parametric downsample: pixel_unshuffle + 1x1 conv projection."""
 
     def __init__(self, in_channels: int, out_channels: int, factor: int):
         super().__init__()
         self.factor = factor
         self.out_channels = out_channels
-        # After pixel_unshuffle: C_expanded = in_channels * factor
-        # We need to map C_expanded → out_channels via grouped averaging
-        self.c_expanded = in_channels * factor
+        c_expanded = in_channels * factor
+        self.proj = WNConv1d(c_expanded, out_channels, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = pixel_unshuffle_1d(x, self.factor)  # [B, C*s, T/s]
-        B, C, T = x.shape
-        # Use simple linear interpolation on channel dim if not evenly divisible
-        # This is equivalent to adaptive average pooling but deterministic
-        x = x.permute(0, 2, 1)  # [B, T, C]
-        x = F.adaptive_avg_pool1d(x, self.out_channels)  # [B, T, out_ch]
-        return x.permute(0, 2, 1)  # [B, out_ch, T]
+        return self.proj(x)  # [B, out_ch, T/s]
 
 
 class UpsampleShortcut(nn.Module):
-    """Non-parametric upsample: channel interpolation + pixel_shuffle."""
+    """Upsample shortcut: 1x1 conv to expand channels + pixel_shuffle."""
 
     def __init__(self, in_channels: int, out_channels: int, factor: int):
         super().__init__()
         self.factor = factor
-        self.in_channels = in_channels
-        self.out_channels = out_channels
         self.target_channels = out_channels * factor
+        self.proj = WNConv1d(in_channels, self.target_channels, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T = x.shape
-        repeats = math.ceil(self.target_channels / C)
-        x_rep = x.repeat_interleave(repeats, dim=1)  # [B, C*repeats, T]
-        x_rep = x_rep[:, :self.target_channels, :]  # trim to exact target
-        return pixel_shuffle_1d(x_rep, self.factor)  # [B, out_ch, T*factor]
+        x = self.proj(x)  # [B, out_ch*factor, T]
+        return pixel_shuffle_1d(x, self.factor)  # [B, out_ch, T*factor]
 
 
 # ─── Activation ──────────────────────────────────────────────
@@ -264,7 +254,6 @@ class WavVAEDecoder(nn.Module):
         self.tail = nn.Sequential(
             SnakeBeta(channels[-1]),
             WNConv1d(channels[-1], 1, kernel_size=7, padding=3, bias=False),
-            nn.Tanh(),
         )
 
     def forward(self, z: torch.Tensor, output_length: int | None = None) -> torch.Tensor:
@@ -285,20 +274,33 @@ class WavVAEDecoder(nn.Module):
 
 
 class VAEBottleneck(nn.Module):
-    """VAE bottleneck with softplus std parameterization.
+    """VAE bottleneck with softplus std parameterization + KL warmup.
 
     Matches LongCat-AudioDiT: mean + softplus(scale_param) + 1e-4.
-    Much more numerically stable than exp(0.5 * log_var).
+    V14.1: adds KL warmup to prevent posterior collapse.
     """
 
     def __init__(
         self,
-        kl_weight: float = 1e-4,
-        free_bits: float = 0.25,
+        kl_weight: float = 1e-2,
+        free_bits: float = 0.1,
+        kl_warmup_steps: int = 2000,
     ):
         super().__init__()
         self.kl_weight = kl_weight
         self.free_bits = free_bits
+        self.kl_warmup_steps = kl_warmup_steps
+        self._step = 0
+
+    def set_step(self, step: int) -> None:
+        self._step = step
+
+    @property
+    def effective_kl_weight(self) -> float:
+        if self.kl_warmup_steps <= 0:
+            return self.kl_weight
+        progress = min(self._step / self.kl_warmup_steps, 1.0)
+        return self.kl_weight * progress
 
     def encode(
         self, encoder_output: torch.Tensor, training: bool = True,
@@ -316,12 +318,12 @@ class VAEBottleneck(nn.Module):
         return z, mean, std
 
     def kl_loss(self, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        """KL(q(z|x) || N(0,I)) with free-bits, using (mean, std) parameterization."""
+        """KL(q(z|x) || N(0,I)) with free-bits and warmup."""
         var = std.pow(2)
         log_var = var.log()
         kl_per_dim = -0.5 * (1 + log_var - mean.pow(2) - var)
         kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
-        return self.kl_weight * kl_per_dim.mean()
+        return self.effective_kl_weight * kl_per_dim.mean()
 
 
 # ─── WavVAE Main Model ──────────────────────────────────────
@@ -337,8 +339,9 @@ class WavVAE(nn.Module):
         decoder_channels: Sequence[int] | None = None,
         strides: Sequence[int] = (7, 7, 9),
         dilations: Sequence[int] = (1, 3, 9),
-        kl_weight: float = 1e-4,
-        free_bits: float = 0.25,
+        kl_weight: float = 1e-2,
+        free_bits: float = 0.1,
+        kl_warmup_steps: int = 2000,
     ):
         super().__init__()
         if decoder_channels is None:
@@ -359,8 +362,13 @@ class WavVAE(nn.Module):
         self.bottleneck = VAEBottleneck(
             kl_weight=kl_weight,
             free_bits=free_bits,
+            kl_warmup_steps=kl_warmup_steps,
         )
         self._strides = list(strides)
+
+    def set_step(self, step: int) -> None:
+        """Update global step for KL warmup scheduling."""
+        self.bottleneck.set_step(step)
 
     @property
     def total_stride(self) -> int:

@@ -1,0 +1,10 @@
+defaults:
+  - runtime: remote
+  - experiment: wav_vae
+  - _self_
+
+hydra:
+  run:
+    dir: ${runtime.project_root}/outputs/hydra/${now:%Y-%m-%d}/${now:%H-%M-%S}_${experiment.run_name}
+  job:
+    chdir: false

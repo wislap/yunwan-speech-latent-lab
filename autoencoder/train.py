@@ -270,6 +270,7 @@ def train(args: DictConfig) -> None:
         dilations=list(args.dilations),
         kl_weight=float(args.kl_weight),
         free_bits=float(args.free_bits),
+        kl_warmup_steps=int(args.get("kl_warmup_steps", 2000)),
     ).to(device)
 
     print(f"WavVAE parameters: {count_parameters(model):,}")
@@ -413,6 +414,7 @@ def train(args: DictConfig) -> None:
             audio = audio.to(device, non_blocking=True)
 
             # ── Generator step ───────────────────────────────
+            model.set_step(global_step)
             out = model(audio)
             x_hat = out["x_hat"]
             kl_loss = out["kl_loss"]
@@ -574,7 +576,7 @@ def train(args: DictConfig) -> None:
 # ─── Hydra entry point ──────────────────────────────────────
 
 
-@hydra.main(version_base=None, config_path="../conf", config_name="config")
+@hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     print("=" * 60)
     print("V14 Wav-VAE Training")

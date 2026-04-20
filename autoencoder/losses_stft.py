@@ -68,8 +68,8 @@ class STFTLoss(nn.Module):
         x_mag_w = x_mag * w
         y_mag_w = y_mag * w
         
-        # Spectral convergence loss (加权)
-        sc_loss = torch.norm(y_mag_w - x_mag_w, p="fro") / (torch.norm(y_mag_w, p="fro") + 1e-4)
+        # Spectral convergence loss (加权) — detach denominator to stabilize gradients
+        sc_loss = torch.norm(y_mag_w - x_mag_w, p="fro") / (torch.norm(y_mag_w, p="fro").detach() + 1e-4)
         
         # Log magnitude loss (加权)  [eps=1e-4: FP16 safe, 1e-8 underflows to 0]
         log_loss = F.l1_loss(torch.log(x_mag_w + 1e-4), torch.log(y_mag_w + 1e-4))

@@ -1,0 +1,7 @@
+project_root: /home/yun_wan/python_programe/playground3
+python_bin: python
+cuda_device: 0
+data_path: ${runtime.project_root}/data/LJSpeech-1.1/wavs
+eval_data_path: ${runtime.project_root}/data/LJSpeech-1.1/wavs
+site_tag: local
+role_tag: main

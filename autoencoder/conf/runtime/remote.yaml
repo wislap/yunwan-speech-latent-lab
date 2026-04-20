@@ -1,0 +1,7 @@
+project_root: /root/autodl-tmp/project
+python_bin: /root/miniconda3/bin/python
+cuda_device: 0
+data_path: /root/autodl-tmp/project/data/ljspeech_train_splits.json
+eval_data_path: /root/autodl-tmp/project/data/ljspeech_train_splits.json
+site_tag: remote
+role_tag: main
