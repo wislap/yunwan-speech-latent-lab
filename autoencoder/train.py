@@ -39,17 +39,29 @@ from autoencoder.models.discriminator_v14 import V14Discriminator
 
 
 class AudioDataset(Dataset):
-    """Simple audio dataset: loads wav files, random crops to segment_length."""
+    """Audio dataset with stride-aligned cropping.
+    
+    All returned audio lengths are exact multiples of total_stride,
+    eliminating boundary padding artifacts in encoder/decoder.
+    """
 
     def __init__(
         self,
         data_path: str,
-        segment_length: int = 65536,
+        segment_length: int = 65268,  # 441 * 148
         sr: int = 22050,
+        total_stride: int = 441,
     ):
         self.segment_length = segment_length
         self.sr = sr
+        self.total_stride = total_stride
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
+
+        # Validate segment_length is stride-aligned
+        assert segment_length % total_stride == 0, (
+            f"segment_length={segment_length} must be divisible by "
+            f"total_stride={total_stride}"
+        )
 
         # data_path can be a JSON file (list of dicts with audio_path)
         # or a directory of wav files
@@ -60,7 +72,6 @@ class AudioDataset(Dataset):
             self.audio_paths = []
             for item in items:
                 if isinstance(item, dict):
-                    # Try common keys
                     for key in ("audio_path", "path", "wav_path", "file"):
                         if key in item:
                             self.audio_paths.append(str(item[key]))
@@ -81,11 +92,9 @@ class AudioDataset(Dataset):
         return len(self.audio_paths)
 
     def _resolve_path(self, path: str) -> str:
-        """Try to resolve relative paths."""
         p = Path(path)
         if p.exists():
             return str(p)
-        # Try relative to cwd
         cwd_p = Path.cwd() / p
         if cwd_p.exists():
             return str(cwd_p)
@@ -98,9 +107,8 @@ class AudioDataset(Dataset):
             data, file_sr = sf.read(path)
             audio = torch.from_numpy(data.astype('float32'))
             if audio.dim() > 1:
-                audio = audio.mean(dim=-1)  # to mono
+                audio = audio.mean(dim=-1)
         except Exception:
-            # Return silence on error
             return torch.zeros(self.segment_length)
 
         # Resample if needed
@@ -109,12 +117,17 @@ class AudioDataset(Dataset):
                 self._resamplers[file_sr] = torchaudio.transforms.Resample(file_sr, self.sr)
             audio = self._resamplers[file_sr](audio)
 
-        # Random crop or pad
         T = audio.shape[0]
+        s = self.total_stride
+
         if T >= self.segment_length:
-            start = torch.randint(0, T - self.segment_length + 1, (1,)).item()
+            # Random crop, start aligned to stride
+            max_start = T - self.segment_length
+            start = torch.randint(0, max_start + 1, (1,)).item()
+            start = (start // s) * s  # align to stride
             audio = audio[start : start + self.segment_length]
         else:
+            # Pad short audio to segment_length (already stride-aligned)
             audio = F.pad(audio, (0, self.segment_length - T))
 
         return audio
@@ -316,9 +329,14 @@ def train(args: DictConfig) -> None:
     ).to(device)
 
     # ── Data ─────────────────────────────────────────────────
-    train_dataset = AudioDataset(args.data_path, segment_length, sr)
+    total_stride = model.total_stride
+    # Align segment_length to total_stride
+    segment_length = (segment_length // total_stride) * total_stride
+    print(f"  Segment length (stride-aligned): {segment_length} ({segment_length // total_stride} frames)")
+
+    train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride)
     eval_dataset = AudioDataset(
-        args.get("eval_data_path", args.data_path), segment_length, sr,
+        args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
     )
 
     num_workers = int(args.get("num_workers", 4))
@@ -386,6 +404,10 @@ def train(args: DictConfig) -> None:
         start_epoch = ckpt.get("epoch", 0) + 1
         global_step = ckpt.get("global_step", 0)
         best_snr = ckpt.get("best_snr", float("-inf"))
+        if "g_scheduler" in ckpt:
+            g_scheduler.load_state_dict(ckpt["g_scheduler"])
+        if d_scheduler is not None and "d_scheduler" in ckpt:
+            d_scheduler.load_state_dict(ckpt["d_scheduler"])
         print(f"  Resumed at epoch {start_epoch}, step {global_step}")
 
     # ── Training config ──────────────────────────────────────
@@ -583,6 +605,7 @@ def train(args: DictConfig) -> None:
         save_dict = {
             "model": model.state_dict(),
             "g_optimizer": g_optimizer.state_dict(),
+            "g_scheduler": g_scheduler.state_dict(),
             "epoch": epoch,
             "global_step": global_step,
             "best_snr": best_snr,
@@ -591,6 +614,8 @@ def train(args: DictConfig) -> None:
             save_dict["disc"] = disc.state_dict()
         if d_optimizer is not None:
             save_dict["d_optimizer"] = d_optimizer.state_dict()
+        if d_scheduler is not None:
+            save_dict["d_scheduler"] = d_scheduler.state_dict()
         safe_save(save_dict, output_dir / "latest.pt")
 
     print(f"\nTraining complete. Best SNR: {best_snr:.2f}dB")

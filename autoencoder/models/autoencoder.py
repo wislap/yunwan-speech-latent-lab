@@ -39,31 +39,57 @@ def pixel_shuffle_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
 
 
 class DownsampleShortcut(nn.Module):
-    """Non-parametric downsample: pixel_unshuffle + 1x1 conv projection."""
+    """Non-parametric downsample: pixel_unshuffle + channel averaging.
+
+    Matches LongCat-AudioDiT: no learnable parameters.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, factor: int):
         super().__init__()
         self.factor = factor
         self.out_channels = out_channels
-        c_expanded = in_channels * factor
-        self.proj = WNConv1d(c_expanded, out_channels, kernel_size=1, bias=False)
+        self.c_expanded = in_channels * factor
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = pixel_unshuffle_1d(x, self.factor)  # [B, C*s, T/s]
-        return self.proj(x)  # [B, out_ch, T/s]
+        B, C, T = x.shape
+        # Channel averaging: group C_expanded channels into out_channels groups
+        # and take the mean of each group
+        if C == self.out_channels:
+            return x
+        # Reshape to [B, out_channels, group_size, T] and mean over group_size
+        group_size = C // self.out_channels
+        remainder = C % self.out_channels
+        if remainder == 0:
+            return x.view(B, self.out_channels, group_size, T).mean(dim=2)
+        # Non-evenly divisible: use linear interpolation on channel dim
+        # Permute to [B, T, C], interpolate, permute back
+        x = x.permute(0, 2, 1)  # [B, T, C]
+        x = F.interpolate(x, size=self.out_channels, mode='linear', align_corners=False)
+        return x.permute(0, 2, 1)  # [B, out_ch, T]
 
 
 class UpsampleShortcut(nn.Module):
-    """Upsample shortcut: 1x1 conv to expand channels + pixel_shuffle."""
+    """Non-parametric upsample: channel replication + pixel_shuffle.
+
+    Matches LongCat-AudioDiT: no learnable parameters.
+    """
 
     def __init__(self, in_channels: int, out_channels: int, factor: int):
         super().__init__()
         self.factor = factor
         self.target_channels = out_channels * factor
-        self.proj = WNConv1d(in_channels, self.target_channels, kernel_size=1, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.proj(x)  # [B, out_ch*factor, T]
+        B, C, T = x.shape
+        # Replicate channels to reach target_channels
+        if C == self.target_channels:
+            pass
+        elif self.target_channels % C == 0:
+            x = x.repeat(1, self.target_channels // C, 1)
+        else:
+            repeats = math.ceil(self.target_channels / C)
+            x = x.repeat(1, repeats, 1)[:, :self.target_channels, :]
         return pixel_shuffle_1d(x, self.factor)  # [B, out_ch, T*factor]
 
 
@@ -236,7 +262,7 @@ class WavVAEEncoder(nn.Module):
 
 
 class WavVAEDecoder(nn.Module):
-    """Conv1d proj → N OobleckDecoderBlocks → SnakeBeta → Conv1d tail → Tanh."""
+    """Conv1d proj → N OobleckDecoderBlocks → SnakeBeta → Conv1d tail."""
 
     def __init__(
         self,
