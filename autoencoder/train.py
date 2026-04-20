@@ -19,6 +19,7 @@ import hydra
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import soundfile as sf_io
 import torchaudio
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
@@ -220,13 +221,13 @@ def evaluate(
             wav_dir = output_dir / "eval_wavs" / f"epoch_{epoch:04d}"
             wav_dir.mkdir(parents=True, exist_ok=True)
             for i in range(min(4, audio.shape[0])):
-                torchaudio.save(
+                sf_io.write(
                     str(wav_dir / f"original_{i}.wav"),
-                    audio[i].cpu(), sr,
+                    audio[i, 0].cpu().numpy(), sr,
                 )
-                torchaudio.save(
+                sf_io.write(
                     str(wav_dir / f"recon_{i}.wav"),
-                    x_hat[i].cpu(), sr,
+                    x_hat[i, 0].cpu().numpy(), sr,
                 )
 
         count += 1
