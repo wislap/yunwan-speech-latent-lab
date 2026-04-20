@@ -42,7 +42,7 @@ train:
   sr: 22050
 
   # ─── Adversarial ──────────────────────────────────────────
-  adv_enable: true
+  adv_enable: false
   adv_start_epoch: 10
   adv_d_lr: 1.0e-4
 

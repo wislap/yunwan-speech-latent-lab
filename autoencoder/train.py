@@ -377,7 +377,8 @@ def train(args: DictConfig) -> None:
         print(f"Resuming from {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
-        g_optimizer.load_state_dict(ckpt["g_optimizer"])
+        if "g_optimizer" in ckpt:
+            g_optimizer.load_state_dict(ckpt["g_optimizer"])
         if disc is not None and "disc" in ckpt:
             disc.load_state_dict(ckpt["disc"])
         if d_optimizer is not None and "d_optimizer" in ckpt:
