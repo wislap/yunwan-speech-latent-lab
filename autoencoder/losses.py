@@ -90,36 +90,32 @@ def compute_reconstruction_loss(
     mrstft_loss_fn: nn.Module,
     mel_loss_fn: nn.Module,
     reg_loss: torch.Tensor,
-    l1_weight: float = 1.0,
+    l1_weight: float = 10.0,
+    l2_weight: float = 5.0,
     stft_weight: float = 0.5,
-    mel_weight: float = 1.0,
+    mel_weight: float = 0.1,
 ) -> dict[str, torch.Tensor]:
     """Aggregate all reconstruction losses.
 
-    Includes an energy matching term to prevent the model from
-    collapsing to near-zero output.
+    L1+L2 time-domain losses dominate to directly optimize waveform accuracy.
     """
     l1_loss = F.l1_loss(x_hat, x)
+    l2_loss = F.mse_loss(x_hat, x)
     stft_loss = mrstft_loss_fn(x_hat, x)
     mel_loss = mel_loss_fn(x_hat, x)
 
-    # Energy matching: penalize RMS difference to prevent output collapse
-    x_rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-8)
-    xh_rms = torch.sqrt(torch.mean(x_hat ** 2, dim=-1, keepdim=True) + 1e-8)
-    energy_loss = F.l1_loss(xh_rms, x_rms)
-
     total = (
         l1_weight * l1_loss
+        + l2_weight * l2_loss
         + stft_weight * stft_loss
         + mel_weight * mel_loss
-        + energy_loss
         + reg_loss
     )
     return {
         "total": total,
         "l1": l1_loss,
+        "l2": l2_loss,
         "stft": stft_loss,
         "mel": mel_loss,
-        "energy": energy_loss,
         "reg": reg_loss,
     }

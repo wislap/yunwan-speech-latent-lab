@@ -419,6 +419,7 @@ def train(args: DictConfig) -> None:
     eval_every_epochs = int(args.get("eval_every_epochs", 5))
 
     l1_weight = float(args.l1_time_weight)
+    l2_weight = float(args.get("l2_time_weight", 5.0))
     stft_weight = float(args.stft_weight)
     mel_weight = float(args.mel_weight)
     adv_g_weight = float(args.adv_g_weight)
@@ -464,7 +465,8 @@ def train(args: DictConfig) -> None:
 
                 recon_losses = compute_reconstruction_loss(
                     audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
-                    l1_weight=l1_weight, stft_weight=stft_weight, mel_weight=mel_weight,
+                    l1_weight=l1_weight, l2_weight=l2_weight,
+                    stft_weight=stft_weight, mel_weight=mel_weight,
                 )
                 g_loss = recon_losses["total"]
 
@@ -545,9 +547,9 @@ def train(args: DictConfig) -> None:
                     f"  [epoch {epoch}/{epochs}] step {global_step} | "
                     f"G={g_loss.item():.4f} "
                     f"(l1={recon_losses['l1'].item():.4f} "
+                    f"l2={recon_losses['l2'].item():.4f} "
                     f"stft={recon_losses['stft'].item():.4f} "
                     f"mel={recon_losses['mel'].item():.4f} "
-                    f"nrg={recon_losses['energy'].item():.4f} "
                     f"reg={recon_losses['reg'].item():.6f})"
                 )
                 if use_adv:

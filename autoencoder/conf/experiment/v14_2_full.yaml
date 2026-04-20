@@ -25,9 +25,10 @@ train:
   reg_warmup_steps: 1000
 
   # ─── Loss weights ─────────────────────────────────────────
-  l1_time_weight: 1.0
+  l1_time_weight: 10.0
+  l2_time_weight: 5.0
   stft_weight: 0.5
-  mel_weight: 1.0
+  mel_weight: 0.1
   adv_g_weight: 0.5
   adv_fm_weight: 2.0
 
@@ -37,7 +38,7 @@ train:
   lr: 3.0e-4
   lr_warmup_steps: 500
   scheduler: cosine
-  grad_clip: 0.5
+  grad_clip: 1.0
   segment_length: 51200    # 512 * 100, stride-aligned
   epochs: 50
   sr: 22050
