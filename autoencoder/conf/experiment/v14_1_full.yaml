@@ -32,8 +32,8 @@ train:
   adv_fm_weight: 2.0
 
   # ─── Training ─────────────────────────────────────────────
-  batch_size: 8
-  grad_accum_steps: 2
+  batch_size: 4
+  grad_accum_steps: 4
   lr: 3.0e-4
   scheduler: cosine
   grad_clip: 0.5
