@@ -192,9 +192,9 @@ def evaluate(
             audio = audio.unsqueeze(1)
         audio = audio.to(device)
 
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            out = model(audio)
-            x_hat = out["x_hat"]
+        out = model(audio)
+        x_hat = out["x_hat"].float()
+        audio = audio.float()
 
         # SNR
         snr_total += compute_snr(x_hat, audio)
