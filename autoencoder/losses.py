@@ -67,16 +67,23 @@ def compute_reconstruction_loss(
 ) -> dict[str, torch.Tensor]:
     """Aggregate all reconstruction losses.
 
-    Returns a dict with individual loss terms and the total.
+    Includes an energy matching term to prevent the model from
+    collapsing to near-zero output.
     """
     l1_loss = F.l1_loss(x_hat, x)
     stft_loss = mrstft_loss_fn(x_hat, x)
     mel_loss = mel_loss_fn(x_hat, x)
 
+    # Energy matching: penalize RMS difference to prevent output collapse
+    x_rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + 1e-8)
+    xh_rms = torch.sqrt(torch.mean(x_hat ** 2, dim=-1, keepdim=True) + 1e-8)
+    energy_loss = F.l1_loss(xh_rms, x_rms)
+
     total = (
         l1_weight * l1_loss
         + stft_weight * stft_loss
         + mel_weight * mel_loss
+        + energy_loss
         + reg_loss
     )
     return {
@@ -84,5 +91,6 @@ def compute_reconstruction_loss(
         "l1": l1_loss,
         "stft": stft_loss,
         "mel": mel_loss,
+        "energy": energy_loss,
         "reg": reg_loss,
     }

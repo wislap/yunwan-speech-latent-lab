@@ -6,10 +6,10 @@ import torch.nn.functional as F
 
 
 class STFTLoss(nn.Module):
-    """单分辨率 STFT 损失 (DAC/Stable Audio style)
+    """单分辨率 STFT 损失
     
-    L1(magnitude) + L1(log(magnitude^2))
-    不使用 spectral convergence（主流做法）。
+    Spectral convergence (detach 分母, 全局 Frobenius) + log magnitude L1.
+    和 overfit 验证过的版本一致。
     """
     
     def __init__(
@@ -18,23 +18,14 @@ class STFTLoss(nn.Module):
         hop_size: int = 256,
         win_size: int = 1024,
         sr: int = 24000,
-        log_pow: float = 2.0,
-        clamp_eps: float = 1e-5,
     ):
         super().__init__()
         self.fft_size = fft_size
         self.hop_size = hop_size
         self.win_size = win_size
-        self.log_pow = log_pow
-        self.clamp_eps = clamp_eps
         self.register_buffer("window", torch.hann_window(win_size))
         
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [B, 1, T] 预测音频
-            y: [B, 1, T] 目标音频
-        """
         x = x.squeeze(1).float()
         y = y.squeeze(1).float()
         
@@ -50,16 +41,13 @@ class STFTLoss(nn.Module):
         x_mag = torch.abs(x_stft)
         y_mag = torch.abs(y_stft)
         
-        # Linear magnitude L1
-        mag_loss = F.l1_loss(x_mag, y_mag)
+        # Spectral convergence (detach denominator)
+        sc_loss = torch.norm(y_mag - x_mag, p="fro") / (torch.norm(y_mag, p="fro").detach() + 1e-4)
         
-        # Log magnitude L1 (with power compression, matching DAC)
-        log_loss = F.l1_loss(
-            torch.log(x_mag.clamp(min=self.clamp_eps).pow(self.log_pow)),
-            torch.log(y_mag.clamp(min=self.clamp_eps).pow(self.log_pow)),
-        )
+        # Log magnitude L1
+        log_loss = F.l1_loss(torch.log(x_mag + 1e-5), torch.log(y_mag + 1e-5))
         
-        return mag_loss + log_loss
+        return sc_loss + log_loss
 
 
 class MultiResolutionSTFTLoss(nn.Module):

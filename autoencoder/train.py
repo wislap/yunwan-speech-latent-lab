@@ -93,15 +93,14 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx: int) -> torch.Tensor:
         path = self._resolve_path(self.audio_paths[idx])
         try:
-            audio, file_sr = torchaudio.load(path)
+            import soundfile as sf
+            data, file_sr = sf.read(path)
+            audio = torch.from_numpy(data.astype('float32'))
+            if audio.dim() > 1:
+                audio = audio.mean(dim=-1)  # to mono
         except Exception:
             # Return silence on error
             return torch.zeros(self.segment_length)
-
-        # To mono
-        if audio.shape[0] > 1:
-            audio = audio.mean(dim=0, keepdim=True)
-        audio = audio.squeeze(0)  # [T]
 
         # Resample if needed
         if file_sr != self.sr:
@@ -524,7 +523,8 @@ def train(args: DictConfig) -> None:
                     f"(l1={recon_losses['l1'].item():.4f} "
                     f"stft={recon_losses['stft'].item():.4f} "
                     f"mel={recon_losses['mel'].item():.4f} "
-                    f"kl={recon_losses['reg'].item():.6f})"
+                    f"nrg={recon_losses['energy'].item():.4f} "
+                    f"reg={recon_losses['reg'].item():.6f})"
                 )
                 if use_adv:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
