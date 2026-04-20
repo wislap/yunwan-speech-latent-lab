@@ -1,14 +1,7 @@
 """V14.1 Wav-VAE single-sample overfit test.
 
-Changes from V14:
-  - KL warmup (0 → kl_weight over first 2000 steps)
-  - Higher kl_weight target (1e-2 vs 1e-4)
-  - Lower free_bits (0.1 vs 0.25)
-  - Decoder without Tanh
-  - Shortcut uses 1x1 Conv instead of adaptive_avg_pool
-  - STFT loss detached denominator
-  - LR warmup + cosine decay
-  - Lower grad_clip (0.5)
+Soft-constrained bottleneck: reparameterization with range penalty
+instead of KL divergence.
 
 Usage:
   python -u -m autoencoder.scripts.overfit
@@ -53,26 +46,29 @@ def main():
     peak_lr = 3e-4
     warmup_steps = 500
     grad_clip = 0.5
-    kl_weight = 1e-2
-    free_bits = 0.1
-    kl_warmup_steps = 2000
-    stft_weight = 0.5  # reduced from 1.0
+    stft_weight = 0.5
     log_every = 100
     save_every = 2000
+
+    # Soft range penalty config
+    reg_weight = 1e-2
+    margin_mean = 3.0
+    std_min = 0.1
+    std_max = 1.5
+    reg_warmup_steps = 1000
 
     # ── Load single audio file ───────────────────────────────
     audio_path = "/root/autodl-tmp/project/data/LJSpeech-1.1/wavs/LJ001-0001.wav"
     data, sr = sf.read(audio_path)
-    audio = torch.from_numpy(data.astype(np.float32)).unsqueeze(0)  # [1, T]
+    audio = torch.from_numpy(data.astype(np.float32)).unsqueeze(0)
 
-    # Crop to segment_length (must be divisible by total_stride=441)
-    segment_length = 441 * 100  # = 44100, exactly 2 seconds
+    segment_length = 441 * 100  # = 44100
     if audio.shape[-1] < segment_length:
         audio = F.pad(audio, (0, segment_length - audio.shape[-1]))
     elif audio.shape[-1] > segment_length:
         audio = audio[:, :segment_length]
 
-    full_audio = audio.unsqueeze(0).to(device)  # [1, 1, T]
+    full_audio = audio.unsqueeze(0).to(device)
     print(f"Audio shape: {full_audio.shape}, sr={sr}, duration={full_audio.shape[-1]/sr:.2f}s")
 
     # ── Model ────────────────────────────────────────────────
@@ -81,9 +77,11 @@ def main():
         encoder_channels=(128, 256, 512, 1024),
         strides=(7, 7, 9),
         dilations=(1, 3, 9),
-        kl_weight=kl_weight,
-        free_bits=free_bits,
-        kl_warmup_steps=kl_warmup_steps,
+        reg_weight=reg_weight,
+        margin_mean=margin_mean,
+        std_min=std_min,
+        std_max=std_max,
+        reg_warmup_steps=reg_warmup_steps,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -91,9 +89,9 @@ def main():
     n_dec = sum(p.numel() for p in model.decoder.parameters())
     print(f"Model params: {n_params:,} (enc={n_enc:,}, dec={n_dec:,})")
     print(f"Total stride: {model.total_stride}")
-    print(f"Config: kl_weight={kl_weight}, free_bits={free_bits}, "
-          f"kl_warmup={kl_warmup_steps}, stft_weight={stft_weight}, "
-          f"grad_clip={grad_clip}, peak_lr={peak_lr}")
+    print(f"Config: reg_weight={reg_weight}, margin_mean={margin_mean}, "
+          f"std_range=[{std_min}, {std_max}], reg_warmup={reg_warmup_steps}")
+    print(f"  stft_weight={stft_weight}, grad_clip={grad_clip}, peak_lr={peak_lr}")
 
     # ── Loss functions ───────────────────────────────────────
     mrstft = MultiResolutionSTFTLoss(
@@ -105,38 +103,35 @@ def main():
 
     mel_loss_fn = MultiScaleMelLoss(sr=sr).to(device)
 
-    # ── Optimizer (no scheduler — manual LR) ─────────────────
+    # ── Optimizer ────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=peak_lr, betas=(0.8, 0.99), weight_decay=0.01,
     )
 
     # ── Training loop ────────────────────────────────────────
-    print(f"\nStarting V14.1 overfit test: {steps} steps")
+    print(f"\nStarting V14.1 overfit test (soft-constrained): {steps} steps")
     print("=" * 80)
 
     model.train()
     t_start = time.time()
 
     for step in range(1, steps + 1):
-        # Manual LR schedule
         lr = get_lr(step, warmup_steps, peak_lr, steps)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
 
-        # Update KL warmup
         model.set_step(step)
-
         optimizer.zero_grad()
 
         out = model(full_audio)
         x_hat = out["x_hat"]
-        kl_loss = out["kl_loss"]
+        reg_loss = out["reg_loss"]
 
         l1_loss = F.l1_loss(x_hat, full_audio)
         stft_loss = mrstft(x_hat, full_audio)
         mel_loss = mel_loss_fn(x_hat, full_audio)
 
-        total_loss = l1_loss + stft_weight * stft_loss + mel_loss + kl_loss
+        total_loss = l1_loss + stft_weight * stft_loss + mel_loss + reg_loss
 
         if not torch.isfinite(total_loss):
             print(f"  [step {step}] NaN/Inf loss! Skipping.")
@@ -154,17 +149,23 @@ def main():
                 snr = compute_snr(out_eval["x_hat"], full_audio)
                 ratio = out_eval["x_hat"].std().item() / full_audio.std().item()
                 enc_std = out_eval["std"].mean().item()
+                enc_std_min = out_eval["std"].min().item()
+                enc_std_max = out_eval["std"].max().item()
+                z_std = out_eval["z"].std().item()
+                z_mean = out_eval["z"].mean().item()
                 model.train()
 
             elapsed = time.time() - t_start
-            eff_kl_w = model.bottleneck.effective_kl_weight
+            eff_w = model.bottleneck.effective_weight
             print(
                 f"  [{step:5d}/{steps}] "
                 f"loss={total_loss.item():.4f} "
                 f"(l1={l1_loss.item():.4f} stft={stft_loss.item():.4f} "
-                f"mel={mel_loss.item():.4f} kl={kl_loss.item():.6f}) "
-                f"| SNR={snr:+.2f}dB ratio={ratio:.3f} enc_std={enc_std:.4f} "
-                f"| gnorm={grad_norm:.2f} lr={lr:.2e} kl_w={eff_kl_w:.1e} "
+                f"mel={mel_loss.item():.4f} reg={reg_loss.item():.6f}) "
+                f"| SNR={snr:+.2f}dB ratio={ratio:.3f} "
+                f"enc_std={enc_std:.4f}[{enc_std_min:.4f},{enc_std_max:.4f}] "
+                f"z={z_mean:.3f}±{z_std:.3f} "
+                f"| gnorm={grad_norm:.2f} lr={lr:.2e} rw={eff_w:.1e} "
                 f"| {elapsed:.1f}s"
             )
 
@@ -180,7 +181,7 @@ def main():
                 f"{save_dir}/recon_step{step:05d}.wav",
                 out_save["x_hat"][0, 0].cpu().numpy(), sr,
             )
-            if step == save_every:  # save original once
+            if step == save_every:
                 sf.write(
                     f"{save_dir}/original.wav",
                     full_audio[0, 0].cpu().numpy(), sr,
@@ -200,8 +201,8 @@ def main():
     print(f"  Final SNR: {final_snr:+.2f} dB")
     print(f"  Final ratio: {final_ratio:.3f}")
     print(f"  Latent shape: {out_final['z'].shape}")
-    print(f"  Latent std: {out_final['z'].std().item():.4f}")
-    print(f"  Latent mean: {out_final['z'].mean().item():.4f}")
+    print(f"  Latent z std: {out_final['z'].std().item():.4f}")
+    print(f"  Latent z mean: {out_final['z'].mean().item():.4f}")
     print(f"  Encoder std (mean): {out_final['std'].mean().item():.4f}")
     print(f"  Encoder std (min/max): {out_final['std'].min().item():.4f} / {out_final['std'].max().item():.4f}")
 

@@ -60,9 +60,9 @@ def compute_reconstruction_loss(
     x_hat: torch.Tensor,
     mrstft_loss_fn: nn.Module,
     mel_loss_fn: nn.Module,
-    kl_loss: torch.Tensor,
+    reg_loss: torch.Tensor,
     l1_weight: float = 1.0,
-    stft_weight: float = 1.0,
+    stft_weight: float = 0.5,
     mel_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Aggregate all reconstruction losses.
@@ -77,12 +77,12 @@ def compute_reconstruction_loss(
         l1_weight * l1_loss
         + stft_weight * stft_loss
         + mel_weight * mel_loss
-        + kl_loss
+        + reg_loss
     )
     return {
         "total": total,
         "l1": l1_loss,
         "stft": stft_loss,
         "mel": mel_loss,
-        "kl": kl_loss,
+        "reg": reg_loss,
     }

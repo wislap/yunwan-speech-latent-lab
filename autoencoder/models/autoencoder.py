@@ -274,41 +274,46 @@ class WavVAEDecoder(nn.Module):
 
 
 class VAEBottleneck(nn.Module):
-    """VAE bottleneck with softplus std parameterization + KL warmup.
+    """Soft-constrained bottleneck: reparameterization + range penalty.
 
-    Matches LongCat-AudioDiT: mean + softplus(scale_param) + 1e-4.
-    V14.1: adds KL warmup to prevent posterior collapse.
+    Instead of KL divergence (which forces N(0,1) and kills reconstruction),
+    uses soft range penalties on mean and std:
+      - mean: penalize |μ| > margin_mean
+      - std:  penalize σ < std_min or σ > std_max
+
+    This keeps latents bounded and well-scaled for downstream DiT
+    without forcing a specific distribution shape.
     """
 
     def __init__(
         self,
-        kl_weight: float = 1e-2,
-        free_bits: float = 0.1,
-        kl_warmup_steps: int = 2000,
+        reg_weight: float = 1e-2,
+        margin_mean: float = 3.0,
+        std_min: float = 0.1,
+        std_max: float = 1.5,
+        warmup_steps: int = 1000,
     ):
         super().__init__()
-        self.kl_weight = kl_weight
-        self.free_bits = free_bits
-        self.kl_warmup_steps = kl_warmup_steps
+        self.reg_weight = reg_weight
+        self.margin_mean = margin_mean
+        self.std_min = std_min
+        self.std_max = std_max
+        self.warmup_steps = warmup_steps
         self._step = 0
 
     def set_step(self, step: int) -> None:
         self._step = step
 
     @property
-    def effective_kl_weight(self) -> float:
-        if self.kl_warmup_steps <= 0:
-            return self.kl_weight
-        progress = min(self._step / self.kl_warmup_steps, 1.0)
-        return self.kl_weight * progress
+    def effective_weight(self) -> float:
+        if self.warmup_steps <= 0:
+            return self.reg_weight
+        return self.reg_weight * min(self._step / self.warmup_steps, 1.0)
 
     def encode(
         self, encoder_output: torch.Tensor, training: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Split encoder output into mean/std, sample z.
-
-        Returns (z, mean, std).
-        """
+        """Split encoder output into mean/std, sample z."""
         mean, scale_param = encoder_output.chunk(2, dim=1)
         std = F.softplus(scale_param) + 1e-4
         if training:
@@ -317,13 +322,14 @@ class VAEBottleneck(nn.Module):
             z = mean
         return z, mean, std
 
-    def kl_loss(self, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-        """KL(q(z|x) || N(0,I)) with free-bits and warmup."""
-        var = std.pow(2)
-        log_var = var.log()
-        kl_per_dim = -0.5 * (1 + log_var - mean.pow(2) - var)
-        kl_per_dim = torch.clamp(kl_per_dim, min=self.free_bits)
-        return self.effective_kl_weight * kl_per_dim.mean()
+    def reg_loss(self, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+        """Soft range penalty on mean and std."""
+        # Mean penalty: penalize |μ| > margin
+        mean_penalty = torch.mean(F.relu(mean.abs() - self.margin_mean) ** 2)
+        # Std penalty: penalize σ < std_min or σ > std_max
+        std_lo_penalty = torch.mean(F.relu(self.std_min - std) ** 2)
+        std_hi_penalty = torch.mean(F.relu(std - self.std_max) ** 2)
+        return self.effective_weight * (mean_penalty + std_lo_penalty + std_hi_penalty)
 
 
 # ─── WavVAE Main Model ──────────────────────────────────────
@@ -339,9 +345,11 @@ class WavVAE(nn.Module):
         decoder_channels: Sequence[int] | None = None,
         strides: Sequence[int] = (7, 7, 9),
         dilations: Sequence[int] = (1, 3, 9),
-        kl_weight: float = 1e-2,
-        free_bits: float = 0.1,
-        kl_warmup_steps: int = 2000,
+        reg_weight: float = 1e-2,
+        margin_mean: float = 3.0,
+        std_min: float = 0.1,
+        std_max: float = 1.5,
+        reg_warmup_steps: int = 1000,
     ):
         super().__init__()
         if decoder_channels is None:
@@ -360,14 +368,16 @@ class WavVAE(nn.Module):
             dilations=dilations,
         )
         self.bottleneck = VAEBottleneck(
-            kl_weight=kl_weight,
-            free_bits=free_bits,
-            kl_warmup_steps=kl_warmup_steps,
+            reg_weight=reg_weight,
+            margin_mean=margin_mean,
+            std_min=std_min,
+            std_max=std_max,
+            warmup_steps=reg_warmup_steps,
         )
         self._strides = list(strides)
 
     def set_step(self, step: int) -> None:
-        """Update global step for KL warmup scheduling."""
+        """Update global step for regularization warmup."""
         self.bottleneck.set_step(step)
 
     @property
@@ -385,11 +395,11 @@ class WavVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> dict:
         z, mean, std = self.encode(x)
         x_hat = self.decode(z, output_length=x.shape[-1])
-        kl_loss = self.bottleneck.kl_loss(mean, std)
+        reg_loss = self.bottleneck.reg_loss(mean, std)
         return {
             "x_hat": x_hat,
             "z": z,
             "mean": mean,
             "std": std,
-            "kl_loss": kl_loss,
+            "reg_loss": reg_loss,
         }

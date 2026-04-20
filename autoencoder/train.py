@@ -201,8 +201,8 @@ def evaluate(
         # STFT loss
         stft_total += mrstft_loss_fn(x_hat, audio).item()
 
-        # KL
-        kl_total += out["kl_loss"].item()
+        # Regularization loss
+        kl_total += out["reg_loss"].item()
 
         # PESQ (first sample only per batch, CPU)
         if has_pesq and batch_idx < 4:
@@ -268,9 +268,11 @@ def train(args: DictConfig) -> None:
         encoder_channels=list(args.encoder_channels),
         strides=list(args.strides),
         dilations=list(args.dilations),
-        kl_weight=float(args.kl_weight),
-        free_bits=float(args.free_bits),
-        kl_warmup_steps=int(args.get("kl_warmup_steps", 2000)),
+        reg_weight=float(args.get("reg_weight", 1e-2)),
+        margin_mean=float(args.get("margin_mean", 3.0)),
+        std_min=float(args.get("std_min", 0.1)),
+        std_max=float(args.get("std_max", 1.5)),
+        reg_warmup_steps=int(args.get("reg_warmup_steps", 1000)),
     ).to(device)
 
     print(f"WavVAE parameters: {count_parameters(model):,}")
@@ -417,10 +419,10 @@ def train(args: DictConfig) -> None:
             model.set_step(global_step)
             out = model(audio)
             x_hat = out["x_hat"]
-            kl_loss = out["kl_loss"]
+            reg_loss = out["reg_loss"]
 
             recon_losses = compute_reconstruction_loss(
-                audio, x_hat, mrstft_loss_fn, mel_loss_fn, kl_loss,
+                audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
                 l1_weight=l1_weight, stft_weight=stft_weight, mel_weight=mel_weight,
             )
             g_loss = recon_losses["total"]
@@ -503,7 +505,7 @@ def train(args: DictConfig) -> None:
                     f"(l1={recon_losses['l1'].item():.4f} "
                     f"stft={recon_losses['stft'].item():.4f} "
                     f"mel={recon_losses['mel'].item():.4f} "
-                    f"kl={recon_losses['kl'].item():.6f})"
+                    f"kl={recon_losses['reg'].item():.6f})"
                 )
                 if use_adv:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
