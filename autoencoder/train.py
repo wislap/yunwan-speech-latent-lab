@@ -343,12 +343,20 @@ def train(args: DictConfig) -> None:
     if disc is not None:
         d_optimizer = torch.optim.Adam(disc.parameters(), lr=float(args.adv_d_lr), betas=(0.8, 0.99))
 
-    # Cosine scheduler
+    # LR warmup + cosine decay
     total_steps = int(args.epochs) * len(train_loader)
-    g_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(g_optimizer, T_max=total_steps)
+    warmup_steps = int(args.get("lr_warmup_steps", 500))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    g_scheduler = torch.optim.lr_scheduler.LambdaLR(g_optimizer, lr_lambda)
     d_scheduler = None
     if d_optimizer is not None:
-        d_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(d_optimizer, T_max=total_steps)
+        d_scheduler = torch.optim.lr_scheduler.LambdaLR(d_optimizer, lr_lambda)
 
     # ── Checkpoint resume ────────────────────────────────────
     start_epoch = 0
@@ -462,11 +470,11 @@ def train(args: DictConfig) -> None:
 
             if (batch_idx + 1) % grad_accum_steps == 0:
                 g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                # Skip if gradient exploded
-                if torch.isfinite(g_norm) and g_norm < grad_clip * 10:
+                # Skip only if gradient is NaN/Inf
+                if torch.isfinite(g_norm):
                     g_optimizer.step()
                 else:
-                    print(f"  [step {global_step}] Gradient explosion (norm={g_norm:.1f}), skipping")
+                    print(f"  [step {global_step}] NaN gradient (norm={g_norm:.1f}), skipping")
                 g_optimizer.zero_grad()
                 g_scheduler.step()
 
@@ -484,7 +492,7 @@ def train(args: DictConfig) -> None:
 
                     if (batch_idx + 1) % grad_accum_steps == 0:
                         d_norm = torch.nn.utils.clip_grad_norm_(disc.parameters(), grad_clip)
-                        if torch.isfinite(d_norm) and d_norm < grad_clip * 10:
+                        if torch.isfinite(d_norm):
                             d_optimizer.step()
                         d_optimizer.zero_grad()
                         d_scheduler.step()
