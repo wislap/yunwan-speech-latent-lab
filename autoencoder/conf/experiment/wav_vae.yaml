@@ -1,0 +1,63 @@
+version_tag: v14_wav_vae
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: ${experiment.version_tag}
+  data_path: ${runtime.data_path}
+  eval_data_path: ${runtime.eval_data_path}
+
+  # ─── Model architecture ───────────────────────────────────
+  latent_dim: 64
+  strides: [7, 7, 9]
+  encoder_channels: [128, 256, 512, 1024]
+  dilations: [1, 3, 9]
+
+  # ─── VAE ───────────────────────────────────────────────────
+  kl_weight: 1.0e-4
+  free_bits: 0.25
+
+  # ─── Loss weights ─────────────────────────────────────────
+  l1_time_weight: 1.0
+  stft_weight: 1.0
+  mel_weight: 1.0
+  adv_g_weight: 0.5
+  adv_fm_weight: 2.0
+
+  # ─── Training ─────────────────────────────────────────────
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 1.0e-4
+  scheduler: cosine
+  grad_clip: 1.0
+  segment_length: 65536
+  epochs: 50
+  sr: 22050
+
+  # ─── Adversarial training ─────────────────────────────────
+  adv_enable: true
+  adv_start_epoch: 10
+  adv_d_lr: 1.0e-4
+
+  # ─── Multi-resolution STFT loss ───────────────────────────
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+
+  # ─── Multi-scale Mel loss ─────────────────────────────────
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  # ─── Discriminator ────────────────────────────────────────
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  # ─── Evaluation ───────────────────────────────────────────
+  eval_every_epochs: 5
+  eval_batches: 8
+  log_interval: 16
+  diagnostics_interval: 200
+  num_workers: 8
+  prefetch_factor: 4
