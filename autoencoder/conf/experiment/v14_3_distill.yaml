@@ -35,8 +35,8 @@ train:
   mel_weight: 0.1
 
   # ─── Training ─────────────────────────────────────────────
-  batch_size: 4
-  grad_accum_steps: 4
+  batch_size: 12
+  grad_accum_steps: 2
   lr: 3.0e-4
   lr_warmup_steps: 300
   scheduler: cosine

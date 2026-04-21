@@ -193,10 +193,9 @@ class OobleckEncoderBlock(nn.Module):
 
 
 class OobleckDecoderBlock(nn.Module):
-    """SnakeBeta → sub-pixel upsample Conv → 3x DilatedResUnit + shortcut.
+    """SnakeBeta → depthwise-separable sub-pixel upsample → 3x DilatedResUnit + shortcut.
 
-    V14.3: replaces ConvTranspose1d with Conv1d + pixel_shuffle to
-    eliminate mirrored aliasing and tonal artifacts.
+    V14.3: Conv1d + pixel_shuffle (zero aliasing), depthwise-separable for efficiency.
     """
 
     def __init__(
@@ -208,25 +207,29 @@ class OobleckDecoderBlock(nn.Module):
         kernel_size: int = 7,
     ):
         super().__init__()
-        # Sub-pixel upsample: Conv1d expands channels by stride, then pixel_shuffle
         padding = (kernel_size - 1) // 2
-        layers = [
-            SnakeBeta(in_channels),
-            WNConv1d(in_channels, out_channels * stride, kernel_size=kernel_size, padding=padding),
-        ]
-        for d in dilations:
-            layers.append(DilatedResUnit(out_channels, d, kernel_size))
-        self.layers = nn.ModuleList(layers)
+        expanded = out_channels * stride
+
+        # Depthwise-separable sub-pixel conv:
+        # depthwise (spatial mixing) → pointwise (channel expansion) → pixel_shuffle
+        self.act = SnakeBeta(in_channels)
+        self.dw_conv = WNConv1d(in_channels, in_channels, kernel_size=kernel_size,
+                                padding=padding, groups=in_channels)
+        self.pw_conv = WNConv1d(in_channels, expanded, kernel_size=1)
         self.stride = stride
+
+        self.res_units = nn.ModuleList([
+            DilatedResUnit(out_channels, d, kernel_size) for d in dilations
+        ])
         self.shortcut = UpsampleShortcut(in_channels, out_channels, stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Main path: activation → conv → pixel_shuffle → dilated res units
-        h = self.layers[0](x)  # SnakeBeta
-        h = self.layers[1](h)  # Conv1d → [B, out_ch*stride, T]
+        h = self.act(x)
+        h = self.dw_conv(h)
+        h = self.pw_conv(h)  # [B, out_ch*stride, T]
         h = pixel_shuffle_1d(h, self.stride)  # [B, out_ch, T*stride]
-        for layer in self.layers[2:]:  # DilatedResUnits
-            h = layer(h)
+        for unit in self.res_units:
+            h = unit(h)
 
         s = self.shortcut(x)
         min_len = min(h.shape[-1], s.shape[-1])
