@@ -1,11 +1,11 @@
-"""V14 Wav-VAE: Oobleck-style fully convolutional VAE on raw waveforms.
+"""V14.4 Wav-VAE: DAC-style encoder (no shortcut) + sub-pixel decoder.
 
-Architecture aligned with LongCat-AudioDiT's Wav-VAE implementation:
-- SnakeBeta activation (log-scale alpha + beta)
-- pixel_unshuffle/shuffle shortcuts (not adaptive_avg_pool)
-- softplus VAE bottleneck (not exp(log_var))
-- pre-activation before strided conv/transposed conv
-- weight_norm on all convolutions, no LayerNorm/BatchNorm
+Key changes from V14.3:
+- Removed all shortcuts (DownsampleShortcut/UpsampleShortcut) to eliminate
+  aliasing from pixel_unshuffle in encoder path.
+- Encoder: pure sequential (ResUnits → Snake → StridedConv), matching DAC.
+- Decoder: pure sequential (Snake → SubPixelConv → ResUnits), no shortcut.
+- Kept: SnakeBeta, weight_norm, LayerScale, dilated residual units.
 """
 
 import math
@@ -17,15 +17,7 @@ import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 
 
-# ─── Pixel Shuffle 1D ───────────────────────────────────────
-
-
-def pixel_unshuffle_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
-    """[B, C, T] → [B, C*factor, T//factor]  (space-to-channel)."""
-    B, C, T = x.shape
-    T_out = T // factor
-    x = x[:, :, :T_out * factor]  # trim
-    return x.view(B, C, T_out, factor).permute(0, 1, 3, 2).contiguous().view(B, C * factor, T_out)
+# ─── Pixel Shuffle 1D (decoder only) ────────────────────────
 
 
 def pixel_shuffle_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
@@ -33,64 +25,6 @@ def pixel_shuffle_1d(x: torch.Tensor, factor: int) -> torch.Tensor:
     B, C, T = x.shape
     C_out = C // factor
     return x.view(B, C_out, factor, T).permute(0, 1, 3, 2).contiguous().view(B, C_out, T * factor)
-
-
-# ─── Shortcuts (from LongCat-AudioDiT) ──────────────────────
-
-
-class DownsampleShortcut(nn.Module):
-    """Non-parametric downsample: pixel_unshuffle + channel averaging.
-
-    Matches LongCat-AudioDiT: no learnable parameters.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, factor: int):
-        super().__init__()
-        self.factor = factor
-        self.out_channels = out_channels
-        self.c_expanded = in_channels * factor
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = pixel_unshuffle_1d(x, self.factor)  # [B, C*s, T/s]
-        B, C, T = x.shape
-        # Channel averaging: group C_expanded channels into out_channels groups
-        # and take the mean of each group
-        if C == self.out_channels:
-            return x
-        # Reshape to [B, out_channels, group_size, T] and mean over group_size
-        group_size = C // self.out_channels
-        remainder = C % self.out_channels
-        if remainder == 0:
-            return x.view(B, self.out_channels, group_size, T).mean(dim=2)
-        # Non-evenly divisible: use linear interpolation on channel dim
-        # Permute to [B, T, C], interpolate, permute back
-        x = x.permute(0, 2, 1)  # [B, T, C]
-        x = F.interpolate(x, size=self.out_channels, mode='linear', align_corners=False)
-        return x.permute(0, 2, 1)  # [B, out_ch, T]
-
-
-class UpsampleShortcut(nn.Module):
-    """Non-parametric upsample: channel replication + pixel_shuffle.
-
-    Matches LongCat-AudioDiT: no learnable parameters.
-    """
-
-    def __init__(self, in_channels: int, out_channels: int, factor: int):
-        super().__init__()
-        self.factor = factor
-        self.target_channels = out_channels * factor
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, C, T = x.shape
-        # Replicate channels to reach target_channels
-        if C == self.target_channels:
-            pass
-        elif self.target_channels % C == 0:
-            x = x.repeat(1, self.target_channels // C, 1)
-        else:
-            repeats = math.ceil(self.target_channels / C)
-            x = x.repeat(1, repeats, 1)[:, :self.target_channels, :]
-        return pixel_shuffle_1d(x, self.factor)  # [B, out_ch, T*factor]
 
 
 # ─── Activation ──────────────────────────────────────────────
@@ -101,11 +35,6 @@ def _snake_beta(x: torch.Tensor, alpha: torch.Tensor, beta: torch.Tensor) -> tor
 
 
 class SnakeBeta(nn.Module):
-    """Snake-beta activation with log-scale learnable alpha and beta.
-
-    Matches LongCat-AudioDiT's AudioDiTSnakeBeta.
-    """
-
     def __init__(self, channels: int):
         super().__init__()
         self.log_alpha = nn.Parameter(torch.zeros(channels))
@@ -132,10 +61,7 @@ def WNConvTranspose1d(*args, **kwargs) -> nn.ConvTranspose1d:
 
 
 class DilatedResUnit(nn.Module):
-    """Pre-activation residual: Act → Conv(dilation=d) → Act → Conv(1x1) → LayerScale → add.
-
-    Matches LongCat's _VaeResidualUnit + LayerScale for training stability.
-    """
+    """Pre-activation residual with LayerScale."""
 
     def __init__(self, channels: int, dilation: int = 1, kernel_size: int = 7):
         super().__init__()
@@ -152,13 +78,13 @@ class DilatedResUnit(nn.Module):
         return x + self.scale * self.block(x)
 
 
-# ─── Oobleck Encoder Block ──────────────────────────────────
+# ─── Encoder Block (DAC-style, no shortcut) ─────────────────
 
 
-class OobleckEncoderBlock(nn.Module):
-    """3x DilatedResUnit → SnakeBeta → strided Conv + shortcut.
+class EncoderBlock(nn.Module):
+    """3x DilatedResUnit → SnakeBeta → strided Conv.
 
-    Matches LongCat's _VaeEncoderBlock.
+    Pure sequential, no shortcut. Matches DAC's EncoderBlock.
     """
 
     def __init__(
@@ -179,24 +105,19 @@ class OobleckEncoderBlock(nn.Module):
             kernel_size=2 * stride, stride=stride,
             padding=math.ceil(stride / 2),
         ))
-        self.layers = nn.Sequential(*layers)
-        self.shortcut = DownsampleShortcut(in_channels, out_channels, stride)
+        self.block = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.layers(x)
-        s = self.shortcut(x)
-        min_len = min(h.shape[-1], s.shape[-1])
-        return h[:, :, :min_len] + s[:, :, :min_len]
+        return self.block(x)
 
 
-# ─── Oobleck Decoder Block ──────────────────────────────────
+# ─── Decoder Block (sub-pixel, no shortcut) ─────────────────
 
 
-class OobleckDecoderBlock(nn.Module):
-    """SnakeBeta → sub-pixel upsample → 3x DilatedResUnit + shortcut.
+class DecoderBlock(nn.Module):
+    """SnakeBeta → sub-pixel upsample (Conv + pixel_shuffle) → 3x DilatedResUnit.
 
-    V14.3: Conv1d(k=3) + pixel_shuffle. No ConvTranspose, zero aliasing.
-    Small kernel for the upsample conv since DilatedResUnits handle receptive field.
+    No shortcut, no ConvTranspose. Zero aliasing from upsampling.
     """
 
     def __init__(
@@ -209,35 +130,26 @@ class OobleckDecoderBlock(nn.Module):
     ):
         super().__init__()
         expanded = out_channels * stride
-
-        self.act = SnakeBeta(in_channels)
-        # Small kernel (k=3) for channel expansion — DilatedResUnits handle receptive field
-        self.upsample_conv = WNConv1d(in_channels, expanded, kernel_size=3, padding=1)
         self.stride = stride
 
-        self.res_units = nn.ModuleList([
+        self.block = nn.Sequential(
+            SnakeBeta(in_channels),
+            WNConv1d(in_channels, expanded, kernel_size=3, padding=1),
+        )
+        self.res_units = nn.Sequential(*[
             DilatedResUnit(out_channels, d, kernel_size) for d in dilations
         ])
-        self.shortcut = UpsampleShortcut(in_channels, out_channels, stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.act(x)
-        h = self.upsample_conv(h)  # [B, out_ch*stride, T]
+        h = self.block(x)  # [B, out_ch*stride, T]
         h = pixel_shuffle_1d(h, self.stride)  # [B, out_ch, T*stride]
-        for unit in self.res_units:
-            h = unit(h)
-
-        s = self.shortcut(x)
-        min_len = min(h.shape[-1], s.shape[-1])
-        return h[:, :, :min_len] + s[:, :, :min_len]
+        return self.res_units(h)
 
 
 # ─── Encoder ─────────────────────────────────────────────────
 
 
 class WavVAEEncoder(nn.Module):
-    """Conv1d stem → N OobleckEncoderBlocks → Conv1d projection."""
-
     def __init__(
         self,
         latent_dim: int = 64,
@@ -246,16 +158,14 @@ class WavVAEEncoder(nn.Module):
         dilations: Sequence[int] = (1, 3, 9),
     ):
         super().__init__()
-        # encoder_latent_dim = latent_dim * 2 for (mean, scale_param)
         self.stem = WNConv1d(1, channels[0], kernel_size=7, padding=3)
         self.blocks = nn.ModuleList([
-            OobleckEncoderBlock(channels[i], channels[i + 1], strides[i], dilations)
+            EncoderBlock(channels[i], channels[i + 1], strides[i], dilations)
             for i in range(len(strides))
         ])
         self.proj = WNConv1d(channels[-1], latent_dim * 2, kernel_size=3, padding=1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Input [B, 1, T], output [B, latent_dim*2, T']."""
         h = self.stem(x)
         for block in self.blocks:
             h = block(h)
@@ -266,8 +176,6 @@ class WavVAEEncoder(nn.Module):
 
 
 class WavVAEDecoder(nn.Module):
-    """Conv1d proj → N OobleckDecoderBlocks → SnakeBeta → Conv1d tail."""
-
     def __init__(
         self,
         latent_dim: int = 64,
@@ -278,7 +186,7 @@ class WavVAEDecoder(nn.Module):
         super().__init__()
         self.proj = WNConv1d(latent_dim, channels[0], kernel_size=7, padding=3)
         self.blocks = nn.ModuleList([
-            OobleckDecoderBlock(channels[i], channels[i + 1], strides[i], dilations)
+            DecoderBlock(channels[i], channels[i + 1], strides[i], dilations)
             for i in range(len(strides))
         ])
         self.tail = nn.Sequential(
@@ -287,7 +195,6 @@ class WavVAEDecoder(nn.Module):
         )
 
     def forward(self, z: torch.Tensor, output_length: int | None = None) -> torch.Tensor:
-        """Input [B, latent_dim, T'], output [B, 1, T]."""
         h = self.proj(z)
         for block in self.blocks:
             h = block(h)
