@@ -20,6 +20,7 @@ train:
   # ─── Distillation ─────────────────────────────────────────
   teacher_checkpoint: ${runtime.project_root}/outputs/models/wav_vae_v14.2_full_remote_main/best.pt
   freeze_encoder: true
+  latent_manifest: ${runtime.project_root}/data/ljspeech_latents_v14_2/manifest.json
 
   # ─── Bottleneck ────────────────────────────────────────────
   reg_weight: 1.0e-2

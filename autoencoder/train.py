@@ -20,6 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import soundfile as sf_io
+import numpy as np
 import torchaudio
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
@@ -136,6 +137,64 @@ class AudioDataset(Dataset):
 def collate_audio(batch: list[torch.Tensor]) -> torch.Tensor:
     """Stack audio tensors into [B, 1, T]."""
     return torch.stack(batch, dim=0).unsqueeze(1)
+
+
+class LatentDataset(Dataset):
+    """Memory-mapped dataset of pre-extracted (audio, latent) pairs.
+    
+    Reads from packed binary files for zero-overhead random access.
+    Falls back to individual .pt files if packed format not found.
+    """
+
+    def __init__(self, manifest_path: str):
+        manifest_dir = Path(manifest_path).parent
+        packed_dir = manifest_dir / "packed"
+        meta_path = packed_dir / "meta.json"
+
+        if meta_path.exists():
+            # Fast path: memory-mapped
+            with open(meta_path) as f:
+                meta = json.load(f)
+            self.n = meta["n_segments"]
+            self.audio_mmap = np.memmap(
+                str(packed_dir / "audio.bin"), dtype=np.float32, mode='r',
+                shape=(self.n, meta["audio_len"]))
+            self.latent_mmap = np.memmap(
+                str(packed_dir / "latent.bin"), dtype=np.float16, mode='r',
+                shape=(self.n, meta["latent_channels"], meta["latent_frames"]))
+            self._packed = True
+            print(f"  LatentDataset: {self.n} segments (memory-mapped)")
+        else:
+            # Fallback: individual .pt files
+            with open(manifest_path) as f:
+                self.paths = json.load(f)
+            self.n = len(self.paths)
+            self._packed = False
+            print(f"  LatentDataset: {self.n} segments (.pt files)")
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, idx: int) -> dict:
+        if self._packed:
+            return {
+                "audio": torch.from_numpy(self.audio_mmap[idx].copy()),
+                "latent": torch.from_numpy(self.latent_mmap[idx].copy()).float(),
+            }
+        else:
+            data = torch.load(self.paths[idx], map_location="cpu", weights_only=True)
+            return {
+                "audio": data["audio"],
+                "latent": data["latent"].float(),
+            }
+
+
+def collate_latent(batch: list[dict]) -> dict:
+    """Collate latent dataset batch."""
+    return {
+        "audio": torch.stack([b["audio"] for b in batch]).unsqueeze(1),  # [B, 1, T]
+        "latent": torch.stack([b["latent"] for b in batch]),             # [B, C, T']
+    }
 
 
 # ─── Utilities ───────────────────────────────────────────────
@@ -353,28 +412,44 @@ def train(args: DictConfig) -> None:
     ).to(device)
 
     # ── Data ─────────────────────────────────────────────────
+    latent_manifest = args.get("latent_manifest", None)
+    use_latent_dataset = latent_manifest is not None and Path(latent_manifest).exists()
+
     total_stride = model.total_stride
-    # Align segment_length to total_stride
     segment_length = (segment_length // total_stride) * total_stride
     print(f"  Segment length (stride-aligned): {segment_length} ({segment_length // total_stride} frames)")
-
-    train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride)
-    eval_dataset = AudioDataset(
-        args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
-    )
 
     num_workers = int(args.get("num_workers", 4))
     prefetch_factor = int(args.get("prefetch_factor", 2))
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=int(args.batch_size),
-        shuffle=True,
-        num_workers=num_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-        pin_memory=True,
-        drop_last=True,
-        collate_fn=collate_audio,
+    if use_latent_dataset:
+        print(f"  Using pre-extracted latents: {latent_manifest}")
+        train_dataset = LatentDataset(latent_manifest)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(args.batch_size),
+            shuffle=True,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_latent,
+        )
+    else:
+        train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=int(args.batch_size),
+            shuffle=True,
+            num_workers=num_workers,
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_audio,
+        )
+
+    eval_dataset = AudioDataset(
+        args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -475,15 +550,28 @@ def train(args: DictConfig) -> None:
         if d_optimizer is not None:
             d_optimizer.zero_grad()
 
-        for batch_idx, audio in enumerate(train_loader):
-            if audio.dim() == 2:
-                audio = audio.unsqueeze(1)
-            audio = audio.to(device, non_blocking=True)
+        for batch_idx, batch_data in enumerate(train_loader):
+            # Handle both audio-only and latent dataset formats
+            if use_latent_dataset and isinstance(batch_data, dict):
+                audio = batch_data["audio"].to(device, non_blocking=True)
+                latent = batch_data["latent"].to(device, non_blocking=True)
+            else:
+                audio = batch_data
+                if audio.dim() == 2:
+                    audio = audio.unsqueeze(1)
+                audio = audio.to(device, non_blocking=True)
+                latent = None
 
             # ── Generator step ───────────────────────────────
             model.set_step(global_step)
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                out = model(audio)
+                if latent is not None:
+                    # Decoder-only: skip encoder, decode from pre-extracted latent
+                    x_hat = model.decode(latent, output_length=audio.shape[-1])
+                    reg_loss = torch.tensor(0.0, device=device)
+                    out = {"x_hat": x_hat, "reg_loss": reg_loss}
+                else:
+                    out = model(audio)
                 x_hat = out["x_hat"]
                 reg_loss = out["reg_loss"]
 
