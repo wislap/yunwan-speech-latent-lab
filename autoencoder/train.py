@@ -294,6 +294,30 @@ def train(args: DictConfig) -> None:
     print(f"  Decoder: {count_parameters(model.decoder):,}")
     print(f"  Total stride: {model.total_stride}")
 
+    # ── Teacher / encoder freeze ─────────────────────────────
+    teacher_ckpt_path = args.get("teacher_checkpoint", None)
+    freeze_encoder = bool(args.get("freeze_encoder", False))
+
+    if teacher_ckpt_path and Path(teacher_ckpt_path).exists():
+        print(f"  Loading teacher checkpoint: {teacher_ckpt_path}")
+        teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device, weights_only=False)
+        teacher_state = teacher_ckpt["model"]
+        # Load encoder + bottleneck weights (skip decoder)
+        partial_state = {k: v for k, v in teacher_state.items()
+                         if k.startswith("encoder.") or k.startswith("bottleneck.")}
+        missing, unexpected = model.load_state_dict(partial_state, strict=False)
+        print(f"  Loaded {len(partial_state)} encoder/bottleneck keys, "
+              f"{len(missing)} missing (decoder, expected)")
+
+    if freeze_encoder:
+        print("  Freezing encoder and bottleneck")
+        for p in model.encoder.parameters():
+            p.requires_grad = False
+        for p in model.bottleneck.parameters():
+            p.requires_grad = False
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"  Trainable parameters (decoder only): {trainable:,}")
+
     # ── torch.compile ────────────────────────────────────────
     use_compile = bool(args.get("use_compile", False))
     if use_compile and hasattr(torch, "compile"):

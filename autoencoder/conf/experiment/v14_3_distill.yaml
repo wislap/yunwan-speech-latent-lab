@@ -1,0 +1,75 @@
+# V14.3 decoder distillation from V14.2
+# Frozen encoder from V14.2, new sub-pixel decoder
+# 启动: python -m autoencoder.train experiment=v14_3_distill
+
+version_tag: v14.3_distill
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: ${experiment.version_tag}
+  data_path: ${runtime.data_path}
+  eval_data_path: ${runtime.eval_data_path}
+
+  # ─── Model (same arch as V14.2, decoder is new) ───────────
+  latent_dim: 128
+  strides: [2, 4, 4, 4, 4]
+  encoder_channels: [128, 256, 512, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+
+  # ─── Distillation ─────────────────────────────────────────
+  teacher_checkpoint: ${runtime.project_root}/outputs/models/wav_vae_v14.2_full_remote_main/best.pt
+  freeze_encoder: true
+
+  # ─── Bottleneck ────────────────────────────────────────────
+  reg_weight: 1.0e-2
+  margin_mean: 3.0
+  std_min: 0.1
+  std_max: 1.5
+  reg_warmup_steps: 0
+
+  # ─── Loss weights ─────────────────────────────────────────
+  l1_time_weight: 10.0
+  l2_time_weight: 5.0
+  stft_weight: 0.5
+  mel_weight: 0.1
+
+  # ─── Training ─────────────────────────────────────────────
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 3.0e-4
+  lr_warmup_steps: 300
+  scheduler: cosine
+  grad_clip: 1.0
+  segment_length: 51200
+  epochs: 30
+  sr: 22050
+
+  # ─── Adversarial (disabled) ───────────────────────────────
+  adv_enable: false
+  adv_start_epoch: 999
+  adv_d_lr: 1.0e-4
+  adv_g_weight: 0.5
+  adv_fm_weight: 2.0
+
+  # ─── STFT loss ────────────────────────────────────────────
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+
+  # ─── Mel loss ─────────────────────────────────────────────
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  # ─── Discriminator (unused) ───────────────────────────────
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  # ─── Eval / logging ───────────────────────────────────────
+  eval_every_epochs: 5
+  eval_batches: 8
+  log_interval: 50
+  num_workers: 8
+  prefetch_factor: 4

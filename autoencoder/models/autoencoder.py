@@ -193,9 +193,10 @@ class OobleckEncoderBlock(nn.Module):
 
 
 class OobleckDecoderBlock(nn.Module):
-    """SnakeBeta → transposed Conv → 3x DilatedResUnit + shortcut.
+    """SnakeBeta → sub-pixel upsample Conv → 3x DilatedResUnit + shortcut.
 
-    Matches LongCat's _VaeDecoderBlock.
+    V14.3: replaces ConvTranspose1d with Conv1d + pixel_shuffle to
+    eliminate mirrored aliasing and tonal artifacts.
     """
 
     def __init__(
@@ -207,23 +208,27 @@ class OobleckDecoderBlock(nn.Module):
         kernel_size: int = 7,
     ):
         super().__init__()
+        # Sub-pixel upsample: Conv1d expands channels by stride, then pixel_shuffle
+        padding = (kernel_size - 1) // 2
         layers = [
             SnakeBeta(in_channels),
-            WNConvTranspose1d(
-                in_channels, out_channels,
-                kernel_size=2 * stride, stride=stride,
-                padding=math.ceil(stride / 2),
-            ),
+            WNConv1d(in_channels, out_channels * stride, kernel_size=kernel_size, padding=padding),
         ]
         for d in dilations:
             layers.append(DilatedResUnit(out_channels, d, kernel_size))
-        self.layers = nn.Sequential(*layers)
+        self.layers = nn.ModuleList(layers)
+        self.stride = stride
         self.shortcut = UpsampleShortcut(in_channels, out_channels, stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.layers(x)
+        # Main path: activation → conv → pixel_shuffle → dilated res units
+        h = self.layers[0](x)  # SnakeBeta
+        h = self.layers[1](h)  # Conv1d → [B, out_ch*stride, T]
+        h = pixel_shuffle_1d(h, self.stride)  # [B, out_ch, T*stride]
+        for layer in self.layers[2:]:  # DilatedResUnits
+            h = layer(h)
+
         s = self.shortcut(x)
-        # Align lengths (transposed conv may differ by ±1)
         min_len = min(h.shape[-1], s.shape[-1])
         return h[:, :, :min_len] + s[:, :, :min_len]
 
