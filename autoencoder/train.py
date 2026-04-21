@@ -146,47 +146,47 @@ class LatentDataset(Dataset):
     Falls back to individual .pt files if packed format not found.
     """
 
-    def __init__(self, manifest_path: str):
+    def __init__(self, manifest_path: str, max_samples: int = 0):
         manifest_dir = Path(manifest_path).parent
         packed_dir = manifest_dir / "packed"
         meta_path = packed_dir / "meta.json"
 
         if meta_path.exists():
-            # Fast path: memory-mapped
             with open(meta_path) as f:
                 meta = json.load(f)
-            self.n = meta["n_segments"]
+            self.n_total = meta["n_segments"]
             self.audio_mmap = np.memmap(
                 str(packed_dir / "audio.bin"), dtype=np.float32, mode='r',
-                shape=(self.n, meta["audio_len"]))
+                shape=(self.n_total, meta["audio_len"]))
             self.latent_mmap = np.memmap(
                 str(packed_dir / "latent.bin"), dtype=np.float16, mode='r',
-                shape=(self.n, meta["latent_channels"], meta["latent_frames"]))
+                shape=(self.n_total, meta["latent_channels"], meta["latent_frames"]))
             self._packed = True
-            print(f"  LatentDataset: {self.n} segments (memory-mapped)")
         else:
-            # Fallback: individual .pt files
             with open(manifest_path) as f:
                 self.paths = json.load(f)
-            self.n = len(self.paths)
+            self.n_total = len(self.paths)
             self._packed = False
-            print(f"  LatentDataset: {self.n} segments (.pt files)")
+
+        # Limit epoch size (randomly sample each epoch via __getitem__ with modulo)
+        self.n = min(max_samples, self.n_total) if max_samples > 0 else self.n_total
+        print(f"  LatentDataset: {self.n}/{self.n_total} segments per epoch"
+              f" ({'mmap' if self._packed else '.pt'})")
 
     def __len__(self) -> int:
         return self.n
 
     def __getitem__(self, idx: int) -> dict:
+        # Random remap so each epoch sees different segments
+        real_idx = (idx + torch.randint(0, self.n_total, (1,)).item()) % self.n_total
         if self._packed:
             return {
-                "audio": torch.from_numpy(self.audio_mmap[idx].copy()),
-                "latent": torch.from_numpy(self.latent_mmap[idx].copy()).float(),
+                "audio": torch.from_numpy(self.audio_mmap[real_idx].copy()),
+                "latent": torch.from_numpy(self.latent_mmap[real_idx].copy()).float(),
             }
         else:
-            data = torch.load(self.paths[idx], map_location="cpu", weights_only=True)
-            return {
-                "audio": data["audio"],
-                "latent": data["latent"].float(),
-            }
+            data = torch.load(self.paths[real_idx], map_location="cpu", weights_only=True)
+            return {"audio": data["audio"], "latent": data["latent"].float()}
 
 
 def collate_latent(batch: list[dict]) -> dict:
@@ -424,7 +424,7 @@ def train(args: DictConfig) -> None:
 
     if use_latent_dataset:
         print(f"  Using pre-extracted latents: {latent_manifest}")
-        train_dataset = LatentDataset(latent_manifest)
+        train_dataset = LatentDataset(latent_manifest, max_samples=12000)
         train_loader = DataLoader(
             train_dataset,
             batch_size=int(args.batch_size),
