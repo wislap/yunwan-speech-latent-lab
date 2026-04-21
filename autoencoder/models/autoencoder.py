@@ -61,9 +61,14 @@ def WNConvTranspose1d(*args, **kwargs) -> nn.ConvTranspose1d:
 
 
 class DilatedResUnit(nn.Module):
-    """Pre-activation residual with LayerScale."""
+    """Pre-activation residual with warmup LayerScale.
+    
+    Scale warms up from init_scale to target_scale over warmup_steps,
+    then becomes a learnable parameter at target_scale.
+    """
 
-    def __init__(self, channels: int, dilation: int = 1, kernel_size: int = 7):
+    def __init__(self, channels: int, dilation: int = 1, kernel_size: int = 7,
+                 init_scale: float = 0.01, target_scale: float = 1.0):
         super().__init__()
         padding = (kernel_size - 1) * dilation // 2
         self.block = nn.Sequential(
@@ -72,7 +77,9 @@ class DilatedResUnit(nn.Module):
             SnakeBeta(channels),
             WNConv1d(channels, channels, kernel_size=1),
         )
-        self.scale = nn.Parameter(torch.ones(1, channels, 1) * 1e-2)
+        self.scale = nn.Parameter(torch.ones(1, channels, 1) * init_scale)
+        self.init_scale = init_scale
+        self.target_scale = target_scale
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.scale * self.block(x)
@@ -314,8 +321,21 @@ class WavVAE(nn.Module):
         self._strides = list(strides)
 
     def set_step(self, step: int) -> None:
-        """Update global step for regularization warmup."""
+        """Update global step for regularization warmup + LayerScale warmup."""
         self.bottleneck.set_step(step)
+        self._warmup_layer_scales(step)
+
+    def _warmup_layer_scales(self, step: int, warmup_steps: int = 1000) -> None:
+        """Warmup LayerScale from init_scale to target_scale."""
+        progress = min(step / max(warmup_steps, 1), 1.0)
+        for module in self.modules():
+            if isinstance(module, DilatedResUnit):
+                target = module.target_scale
+                init = module.init_scale
+                current = init + (target - init) * progress
+                # Clamp the parameter to at least current warmup value
+                with torch.no_grad():
+                    module.scale.clamp_(min=current)
 
     @property
     def total_stride(self) -> int:
