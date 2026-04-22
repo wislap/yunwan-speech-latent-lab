@@ -48,10 +48,10 @@ train:
   # ─── Adversarial ──────────────────────────────────────────
   adv_enable: true
   adv_start_epoch: 0
-  disc_warmup_epochs: 3
+  disc_warmup_epochs: 0
   adv_d_lr: 4.0e-4
-  adv_g_weight: 1.0
-  adv_fm_weight: 5.0
+  adv_g_weight: 0.05
+  adv_fm_weight: 2.0
 
   # ─── STFT loss ────────────────────────────────────────────
   stft_fft_sizes: [512, 1024, 2048]
