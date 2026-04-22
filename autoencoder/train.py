@@ -44,12 +44,16 @@ class AudioDataset(Dataset):
     
     All returned audio lengths are exact multiples of total_stride,
     eliminating boundary padding artifacts in encoder/decoder.
+    
+    Modes:
+      - segment_length > 0: random crop to fixed length (legacy)
+      - segment_length = 0: full-length, stride-aligned (dynamic batching)
     """
 
     def __init__(
         self,
         data_path: str,
-        segment_length: int = 65268,  # 441 * 148
+        segment_length: int = 0,
         sr: int = 22050,
         total_stride: int = 441,
         augment: bool = False,
@@ -60,11 +64,11 @@ class AudioDataset(Dataset):
         self.augment = augment
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
-        # Validate segment_length is stride-aligned
-        assert segment_length % total_stride == 0, (
-            f"segment_length={segment_length} must be divisible by "
-            f"total_stride={total_stride}"
-        )
+        if segment_length > 0:
+            assert segment_length % total_stride == 0, (
+                f"segment_length={segment_length} must be divisible by "
+                f"total_stride={total_stride}"
+            )
 
         # data_path can be a JSON file (list of dicts with audio_path)
         # or a directory of wav files
@@ -91,6 +95,28 @@ class AudioDataset(Dataset):
         if len(self.audio_paths) == 0:
             raise ValueError(f"No audio files found at {data_path}")
 
+        # Pre-scan lengths for bucket sampler (only in full-length mode)
+        self._lengths = None
+        if segment_length == 0:
+            self._scan_lengths()
+
+    def _scan_lengths(self):
+        """Pre-scan audio file lengths for bucket sampling."""
+        import soundfile as sf
+        lengths = []
+        for p in self.audio_paths:
+            try:
+                info = sf.info(p)
+                T = int(info.frames)
+                T_aligned = (T // self.total_stride) * self.total_stride
+                lengths.append(max(T_aligned, self.total_stride))
+            except Exception:
+                lengths.append(self.total_stride)
+        self._lengths = lengths
+        print(f"  Audio lengths: min={min(lengths)/self.sr:.1f}s, "
+              f"max={max(lengths)/self.sr:.1f}s, "
+              f"mean={sum(lengths)/len(lengths)/self.sr:.1f}s")
+
     def __len__(self) -> int:
         return len(self.audio_paths)
 
@@ -112,7 +138,8 @@ class AudioDataset(Dataset):
             if audio.dim() > 1:
                 audio = audio.mean(dim=-1)
         except Exception:
-            return torch.zeros(self.segment_length)
+            fallback_len = self.segment_length if self.segment_length > 0 else self.total_stride * 100
+            return torch.zeros(fallback_len)
 
         # Resample if needed
         if file_sr != self.sr:
@@ -123,22 +150,27 @@ class AudioDataset(Dataset):
         T = audio.shape[0]
         s = self.total_stride
 
-        if T >= self.segment_length:
-            # Random crop, start aligned to stride
-            max_start = T - self.segment_length
-            start = torch.randint(0, max_start + 1, (1,)).item()
-            start = (start // s) * s  # align to stride
-            audio = audio[start : start + self.segment_length]
+        if self.segment_length > 0:
+            # Fixed-length crop mode
+            if T >= self.segment_length:
+                max_start = T - self.segment_length
+                start = torch.randint(0, max_start + 1, (1,)).item()
+                start = (start // s) * s
+                audio = audio[start : start + self.segment_length]
+            else:
+                audio = F.pad(audio, (0, self.segment_length - T))
         else:
-            # Pad short audio to segment_length (already stride-aligned)
-            audio = F.pad(audio, (0, self.segment_length - T))
+            # Full-length mode: just align to stride
+            T_aligned = (T // s) * s
+            if T_aligned < s:
+                audio = F.pad(audio, (0, s - T))
+            else:
+                audio = audio[:T_aligned]
 
         # Data augmentation
         if self.augment:
-            # Random gain: ±6 dB
             gain_db = (torch.rand(1).item() - 0.5) * 12.0
             audio = audio * (10.0 ** (gain_db / 20.0))
-            # Random additive noise: SNR 30-50 dB
             noise_snr_db = 30.0 + torch.rand(1).item() * 20.0
             sig_power = (audio ** 2).mean().clamp(min=1e-10)
             noise_power = sig_power / (10.0 ** (noise_snr_db / 10.0))
@@ -147,9 +179,41 @@ class AudioDataset(Dataset):
         return audio
 
 
+class BucketSampler(torch.utils.data.Sampler):
+    """Groups samples of similar length into batches to minimize padding.
+    
+    Sorts by length, chunks into buckets of batch_size, shuffles buckets.
+    """
+
+    def __init__(self, lengths: list[int], batch_size: int, drop_last: bool = True):
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        # Sort indices by length
+        self.sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
+
+    def __iter__(self):
+        # Chunk sorted indices into batches
+        batches = []
+        for i in range(0, len(self.sorted_indices), self.batch_size):
+            batch = self.sorted_indices[i:i + self.batch_size]
+            if self.drop_last and len(batch) < self.batch_size:
+                continue
+            batches.append(batch)
+        # Shuffle batch order (not within batch)
+        perm = torch.randperm(len(batches)).tolist()
+        for i in perm:
+            yield from batches[i]
+
+    def __len__(self):
+        n = len(self.sorted_indices) // self.batch_size
+        return n * self.batch_size
+
+
 def collate_audio(batch: list[torch.Tensor]) -> torch.Tensor:
-    """Stack audio tensors into [B, 1, T]."""
-    return torch.stack(batch, dim=0).unsqueeze(1)
+    """Stack audio tensors into [B, 1, T]. Pads to longest in batch."""
+    max_len = max(x.shape[0] for x in batch)
+    padded = [F.pad(x, (0, max_len - x.shape[0])) if x.shape[0] < max_len else x for x in batch]
+    return torch.stack(padded, dim=0).unsqueeze(1)
 
 
 class LatentDataset(Dataset):
@@ -451,16 +515,30 @@ def train(args: DictConfig) -> None:
     else:
         augment = bool(args.get("augment", False))
         train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride, augment=augment)
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=int(args.batch_size),
-            shuffle=True,
-            num_workers=num_workers,
-            prefetch_factor=prefetch_factor if num_workers > 0 else None,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=collate_audio,
-        )
+
+        if segment_length == 0 and train_dataset._lengths is not None:
+            # Full-length mode: use bucket sampler
+            sampler = BucketSampler(train_dataset._lengths, batch_size=int(args.batch_size), drop_last=True)
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=int(args.batch_size),
+                sampler=sampler,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                pin_memory=True,
+                collate_fn=collate_audio,
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=int(args.batch_size),
+                shuffle=True,
+                num_workers=num_workers,
+                prefetch_factor=prefetch_factor if num_workers > 0 else None,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=collate_audio,
+            )
 
     eval_dataset = AudioDataset(
         args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
