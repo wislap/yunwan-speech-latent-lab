@@ -8,8 +8,8 @@ run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
 train:
   output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
   version_tag: ${experiment.version_tag}
-  data_path: ${runtime.data_path}
-  eval_data_path: ${runtime.eval_data_path}
+  data_path: ${runtime.project_root}/data/ljspeech_concat_30s/manifest.json
+  eval_data_path: ${runtime.data_path}
 
   # ─── Model (V14.4 architecture) ───────────────────────────
   latent_dim: 128
@@ -34,13 +34,13 @@ train:
   mel_weight: 0.1
 
   # ─── Training ─────────────────────────────────────────────
-  batch_size: 4
-  grad_accum_steps: 4
+  batch_size: 1
+  grad_accum_steps: 16
   lr: 1.0e-4
   lr_warmup_steps: 200
   scheduler: cosine
   grad_clip: 1.0
-  segment_length: 51200
+  segment_length: 176128
   epochs: 30
   sr: 22050
   augment: true
@@ -48,10 +48,10 @@ train:
   # ─── Adversarial ──────────────────────────────────────────
   adv_enable: true
   adv_start_epoch: 0
-  disc_warmup_epochs: 3
+  disc_warmup_epochs: 0
   adv_d_lr: 1.0e-4
-  adv_g_weight: 0.1
-  adv_fm_weight: 1.0
+  adv_g_weight: 1.0
+  adv_fm_weight: 5.0
 
   # ─── STFT loss ────────────────────────────────────────────
   stft_fft_sizes: [512, 1024, 2048]
