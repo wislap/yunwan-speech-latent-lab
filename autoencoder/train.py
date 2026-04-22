@@ -180,33 +180,56 @@ class AudioDataset(Dataset):
 
 
 class BucketSampler(torch.utils.data.Sampler):
-    """Groups samples of similar length into batches to minimize padding.
+    """Dynamic batching: groups by length, each batch has ~constant total samples.
     
-    Sorts by length, chunks into buckets of batch_size, shuffles buckets.
+    Short audio → larger batch, long audio → smaller batch.
+    Maximizes GPU utilization while avoiding OOM.
     """
 
-    def __init__(self, lengths: list[int], batch_size: int, drop_last: bool = True):
-        self.batch_size = batch_size
+    def __init__(self, lengths: list[int], max_total_samples: int = 200000, drop_last: bool = True):
+        self.lengths = lengths
+        self.max_total_samples = max_total_samples
         self.drop_last = drop_last
         # Sort indices by length
         self.sorted_indices = sorted(range(len(lengths)), key=lambda i: lengths[i])
 
-    def __iter__(self):
-        # Chunk sorted indices into batches
+    def _build_batches(self):
         batches = []
-        for i in range(0, len(self.sorted_indices), self.batch_size):
-            batch = self.sorted_indices[i:i + self.batch_size]
-            if self.drop_last and len(batch) < self.batch_size:
-                continue
-            batches.append(batch)
-        # Shuffle batch order (not within batch)
+        current_batch = []
+        current_samples = 0
+
+        for idx in self.sorted_indices:
+            sample_len = self.lengths[idx]
+            # Would adding this sample exceed budget?
+            new_total = (len(current_batch) + 1) * max(current_samples // max(len(current_batch), 1), sample_len)
+            # Simpler: just track max_len_in_batch * batch_size
+            if current_batch:
+                max_len = max(sample_len, max(self.lengths[i] for i in current_batch))
+                projected = max_len * (len(current_batch) + 1)
+            else:
+                projected = sample_len
+
+            if projected > self.max_total_samples and current_batch:
+                batches.append(current_batch)
+                current_batch = [idx]
+            else:
+                current_batch.append(idx)
+
+        if current_batch and not self.drop_last:
+            batches.append(current_batch)
+        elif current_batch and len(current_batch) > 0:
+            batches.append(current_batch)
+
+        return batches
+
+    def __iter__(self):
+        batches = self._build_batches()
         perm = torch.randperm(len(batches)).tolist()
         for i in perm:
             yield from batches[i]
 
     def __len__(self):
-        n = len(self.sorted_indices) // self.batch_size
-        return n * self.batch_size
+        return len(self.sorted_indices)
 
 
 def collate_audio(batch: list[torch.Tensor]) -> torch.Tensor:
@@ -517,12 +540,28 @@ def train(args: DictConfig) -> None:
         train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride, augment=augment)
 
         if segment_length == 0 and train_dataset._lengths is not None:
-            # Full-length mode: use bucket sampler
-            sampler = BucketSampler(train_dataset._lengths, batch_size=int(args.batch_size), drop_last=True)
+            # Full-length mode: dynamic batch size based on total samples budget
+            max_total_samples = int(args.get("max_total_samples", 200000))
+            bucket_sampler = BucketSampler(train_dataset._lengths, max_total_samples=max_total_samples)
+            # Use batch_sampler (yields list of indices per batch)
+            batch_lists = bucket_sampler._build_batches()
+            print(f"  Dynamic batching: {len(batch_lists)} batches, "
+                  f"bs range [{min(len(b) for b in batch_lists)}-{max(len(b) for b in batch_lists)}], "
+                  f"max_total_samples={max_total_samples}")
+
+            class _BatchSampler:
+                def __init__(self, batches):
+                    self.batches = batches
+                def __iter__(self):
+                    perm = torch.randperm(len(self.batches)).tolist()
+                    for i in perm:
+                        yield self.batches[i]
+                def __len__(self):
+                    return len(self.batches)
+
             train_loader = DataLoader(
                 train_dataset,
-                batch_size=int(args.batch_size),
-                sampler=sampler,
+                batch_sampler=_BatchSampler(batch_lists),
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,

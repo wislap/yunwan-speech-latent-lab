@@ -31,12 +31,13 @@ train:
 
   # ─── Training ─────────────────────────────────────────────
   batch_size: 1
-  grad_accum_steps: 16
+  grad_accum_steps: 4
   lr: 3.0e-4
   lr_warmup_steps: 500
   scheduler: cosine
   grad_clip: 1.0
   segment_length: 0
+  max_total_samples: 180000
   epochs: 100
   sr: 22050
   augment: true
