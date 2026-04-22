@@ -106,9 +106,12 @@ class EncoderBlock(nn.Module):
         self.block = nn.Sequential(*layers)
 
         # Anti-aliased skip: AvgPool (low-pass) + 1x1 conv (channel map)
+        # Initialize skip conv gain small so skip starts near-zero
+        skip_conv = WNConv1d(in_channels, out_channels, kernel_size=1)
+        skip_conv.weight_g.data.fill_(0.01)
         self.skip = nn.Sequential(
             nn.AvgPool1d(kernel_size=stride, stride=stride),
-            WNConv1d(in_channels, out_channels, kernel_size=1),
+            skip_conv,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -147,8 +150,9 @@ class DecoderBlock(nn.Module):
             DilatedResUnit(out_channels, d, kernel_size) for d in dilations
         ])
 
-        # Skip: nearest upsample + 1x1 conv
+        # Skip: nearest upsample + 1x1 conv (init small)
         self.skip_conv = WNConv1d(in_channels, out_channels, kernel_size=1)
+        self.skip_conv.weight_g.data.fill_(0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Main path
@@ -351,7 +355,6 @@ class WavVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> dict:
         z, mean, std = self.encode(x)
         x_hat = self.decode(z, output_length=x.shape[-1])
-        x_hat = x_hat.clamp(-1.0, 1.0)
         reg_loss = self.bottleneck.reg_loss(mean, std)
         return {
             "x_hat": x_hat,
