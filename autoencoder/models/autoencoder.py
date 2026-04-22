@@ -79,10 +79,10 @@ class DilatedResUnit(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """3x DilatedResUnit → SnakeBeta → strided Conv + AvgPool skip.
+    """3x DilatedResUnit → SnakeBeta → strided Conv + parameter-free skip.
 
-    Skip: AvgPool1d (low-pass + downsample) → 1x1 Conv (channel map).
-    AvgPool is a natural anti-aliasing filter — no pixel_unshuffle aliasing.
+    Skip: AvgPool1d (anti-aliased downsample) + channel repeat/truncate.
+    No learnable parameters in skip → no explosion risk.
     """
 
     def __init__(
@@ -104,31 +104,32 @@ class EncoderBlock(nn.Module):
             padding=math.ceil(stride / 2),
         ))
         self.block = nn.Sequential(*layers)
-
-        # Anti-aliased skip: AvgPool (low-pass) + 1x1 conv (channel map)
-        # Initialize skip conv gain small so skip starts near-zero
-        skip_conv = WNConv1d(in_channels, out_channels, kernel_size=1)
-        skip_conv.weight_g.data.fill_(0.01)
-        self.skip = nn.Sequential(
-            nn.AvgPool1d(kernel_size=stride, stride=stride),
-            skip_conv,
-        )
+        self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.pool = nn.AvgPool1d(kernel_size=stride, stride=stride)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.block(x)
-        s = self.skip(x)
-        # Align lengths (AvgPool and strided conv may differ by ±1)
+        # Parameter-free skip: AvgPool + channel adapt
+        s = self.pool(x)  # [B, in_ch, T/stride]
+        if self.in_channels < self.out_channels:
+            # Repeat channels
+            repeats = self.out_channels // self.in_channels
+            s = s.repeat(1, repeats, 1)[:, :self.out_channels, :]
+        elif self.in_channels > self.out_channels:
+            s = s[:, :self.out_channels, :]
         min_len = min(h.shape[-1], s.shape[-1])
         return h[:, :, :min_len] + s[:, :, :min_len]
 
 
-# ─── Decoder Block (sub-pixel + nearest skip) ───────────────
+# ─── Decoder Block (sub-pixel + parameter-free skip) ────────
 
 
 class DecoderBlock(nn.Module):
-    """SnakeBeta → sub-pixel upsample → 3x DilatedResUnit + nearest skip.
+    """SnakeBeta → sub-pixel upsample → 3x DilatedResUnit + parameter-free skip.
 
-    Skip: nearest upsample + 1x1 Conv. No ConvTranspose aliasing.
+    Skip: nearest upsample + channel truncate/repeat. No learnable params.
     """
 
     def __init__(
@@ -142,6 +143,8 @@ class DecoderBlock(nn.Module):
         super().__init__()
         expanded = out_channels * stride
         self.stride = stride
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         # Main path: sub-pixel upsample
         self.act = SnakeBeta(in_channels)
@@ -150,21 +153,19 @@ class DecoderBlock(nn.Module):
             DilatedResUnit(out_channels, d, kernel_size) for d in dilations
         ])
 
-        # Skip: nearest upsample + 1x1 conv (init small)
-        self.skip_conv = WNConv1d(in_channels, out_channels, kernel_size=1)
-        self.skip_conv.weight_g.data.fill_(0.01)
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Main path
         h = self.act(x)
         h = self.upsample_conv(h)
         h = pixel_shuffle_1d(h, self.stride)
         h = self.res_units(h)
-
-        # Skip path: nearest upsample + 1x1
+        # Parameter-free skip: nearest upsample + channel adapt
         s = F.interpolate(x, scale_factor=self.stride, mode='nearest')
-        s = self.skip_conv(s)
-
+        if self.in_channels > self.out_channels:
+            s = s[:, :self.out_channels, :]
+        elif self.in_channels < self.out_channels:
+            repeats = self.out_channels // self.in_channels
+            s = s.repeat(1, repeats, 1)[:, :self.out_channels, :]
         min_len = min(h.shape[-1], s.shape[-1])
         return h[:, :, :min_len] + s[:, :, :min_len]
 

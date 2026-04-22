@@ -461,12 +461,16 @@ def train(args: DictConfig) -> None:
         print(f"  Loading teacher checkpoint: {teacher_ckpt_path}")
         teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device, weights_only=False)
         teacher_state = teacher_ckpt["model"]
-        # Load encoder + bottleneck weights (skip decoder)
-        partial_state = {k: v for k, v in teacher_state.items()
-                         if k.startswith("encoder.") or k.startswith("bottleneck.")}
-        missing, unexpected = model.load_state_dict(partial_state, strict=False)
-        print(f"  Loaded {len(partial_state)} encoder/bottleneck keys, "
-              f"{len(missing)} missing (decoder, expected)")
+        # Try full model load first, fall back to encoder-only
+        try:
+            model.load_state_dict(teacher_state)
+            print(f"  Loaded full model ({len(teacher_state)} keys)")
+        except RuntimeError:
+            partial_state = {k: v for k, v in teacher_state.items()
+                             if k.startswith("encoder.") or k.startswith("bottleneck.")}
+            missing, unexpected = model.load_state_dict(partial_state, strict=False)
+            print(f"  Loaded {len(partial_state)} encoder/bottleneck keys, "
+                  f"{len(missing)} missing (decoder, expected)")
 
     if freeze_encoder:
         print("  Freezing encoder and bottleneck")
@@ -657,8 +661,11 @@ def train(args: DictConfig) -> None:
 
     nan_streak = 0
     max_nan_streak = 20
+    disc_warmup_epochs = int(args.get("disc_warmup_epochs", 0))
 
     print(f"\nStarting training: {epochs} epochs, adv starts at epoch {adv_start_epoch}")
+    if disc_warmup_epochs > 0:
+        print(f"  Discriminator warmup: {disc_warmup_epochs} epochs (AE frozen)")
     print(f"  grad_accum={grad_accum_steps}, grad_clip={grad_clip}")
     print(f"  Loss weights: l1={l1_weight}, stft={stft_weight}, mel={mel_weight}")
     if adv_enable:
@@ -672,6 +679,22 @@ def train(args: DictConfig) -> None:
             disc.train()
 
         use_adv = adv_enable and epoch >= adv_start_epoch
+        # Disc warmup: freeze AE, only train D
+        disc_warming = use_adv and disc_warmup_epochs > 0 and epoch < (adv_start_epoch + disc_warmup_epochs)
+        if disc_warming:
+            model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
+        else:
+            model.train()
+            for p in model.parameters():
+                p.requires_grad = True
+            # Re-freeze encoder/bottleneck if freeze_encoder was set
+            if freeze_encoder:
+                for p in model.encoder.parameters():
+                    p.requires_grad = False
+                for p in model.bottleneck.parameters():
+                    p.requires_grad = False
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         epoch_steps = 0
@@ -743,17 +766,17 @@ def train(args: DictConfig) -> None:
             nan_streak = 0
 
             # Gradient accumulation
-            (g_loss / grad_accum_steps).backward()
+            if not disc_warming:
+                (g_loss / grad_accum_steps).backward()
 
-            if (batch_idx + 1) % grad_accum_steps == 0:
-                g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                # Skip only if gradient is NaN/Inf
-                if torch.isfinite(g_norm):
-                    g_optimizer.step()
-                else:
-                    print(f"  [step {global_step}] NaN gradient (norm={g_norm:.1f}), skipping")
-                g_optimizer.zero_grad()
-                g_scheduler.step()
+                if (batch_idx + 1) % grad_accum_steps == 0:
+                    g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    if torch.isfinite(g_norm):
+                        g_optimizer.step()
+                    else:
+                        print(f"  [step {global_step}] NaN gradient (norm={g_norm:.1f}), skipping")
+                    g_optimizer.zero_grad()
+                    g_scheduler.step()
 
             # ── Discriminator step (Phase 2) ─────────────────
             if use_adv and disc is not None and d_optimizer is not None:
