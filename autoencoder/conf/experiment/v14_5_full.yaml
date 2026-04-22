@@ -25,7 +25,7 @@ train:
 
   # ─── Loss weights ─────────────────────────────────────────
   l1_time_weight: 20.0
-  l2_time_weight: 10.0
+  l2_time_weight: 0.0
   stft_weight: 0.5
   mel_weight: 0.1
 
