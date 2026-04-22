@@ -52,10 +52,12 @@ class AudioDataset(Dataset):
         segment_length: int = 65268,  # 441 * 148
         sr: int = 22050,
         total_stride: int = 441,
+        augment: bool = False,
     ):
         self.segment_length = segment_length
         self.sr = sr
         self.total_stride = total_stride
+        self.augment = augment
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
 
         # Validate segment_length is stride-aligned
@@ -130,6 +132,17 @@ class AudioDataset(Dataset):
         else:
             # Pad short audio to segment_length (already stride-aligned)
             audio = F.pad(audio, (0, self.segment_length - T))
+
+        # Data augmentation
+        if self.augment:
+            # Random gain: ±6 dB
+            gain_db = (torch.rand(1).item() - 0.5) * 12.0
+            audio = audio * (10.0 ** (gain_db / 20.0))
+            # Random additive noise: SNR 30-50 dB
+            noise_snr_db = 30.0 + torch.rand(1).item() * 20.0
+            sig_power = (audio ** 2).mean().clamp(min=1e-10)
+            noise_power = sig_power / (10.0 ** (noise_snr_db / 10.0))
+            audio = audio + torch.randn_like(audio) * noise_power.sqrt()
 
         return audio
 
@@ -436,7 +449,8 @@ def train(args: DictConfig) -> None:
             collate_fn=collate_latent,
         )
     else:
-        train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride)
+        augment = bool(args.get("augment", False))
+        train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride, augment=augment)
         train_loader = DataLoader(
             train_dataset,
             batch_size=int(args.batch_size),

@@ -1,11 +1,9 @@
-"""V14.4 Wav-VAE: DAC-style encoder (no shortcut) + sub-pixel decoder.
+"""V14.5 Wav-VAE: AvgPool skip connections + sub-pixel decoder.
 
-Key changes from V14.3:
-- Removed all shortcuts (DownsampleShortcut/UpsampleShortcut) to eliminate
-  aliasing from pixel_unshuffle in encoder path.
-- Encoder: pure sequential (ResUnits → Snake → StridedConv), matching DAC.
-- Decoder: pure sequential (Snake → SubPixelConv → ResUnits), no shortcut.
-- Kept: SnakeBeta, weight_norm, LayerScale, dilated residual units.
+Changes from V14.4:
+- EncoderBlock: added AvgPool1d + 1x1 Conv skip (anti-aliased, ResNet-style)
+- DecoderBlock: added nearest upsample + 1x1 Conv skip
+- Fixes deep-layer gradient vanishing while avoiding pixel_unshuffle aliasing
 """
 
 import math
@@ -77,13 +75,14 @@ class DilatedResUnit(nn.Module):
         return x + self.block(x)
 
 
-# ─── Encoder Block (DAC-style, no shortcut) ─────────────────
+# ─── Encoder Block (with anti-aliased skip) ─────────────────
 
 
 class EncoderBlock(nn.Module):
-    """3x DilatedResUnit → SnakeBeta → strided Conv.
+    """3x DilatedResUnit → SnakeBeta → strided Conv + AvgPool skip.
 
-    Pure sequential, no shortcut. Matches DAC's EncoderBlock.
+    Skip: AvgPool1d (low-pass + downsample) → 1x1 Conv (channel map).
+    AvgPool is a natural anti-aliasing filter — no pixel_unshuffle aliasing.
     """
 
     def __init__(
@@ -106,17 +105,27 @@ class EncoderBlock(nn.Module):
         ))
         self.block = nn.Sequential(*layers)
 
+        # Anti-aliased skip: AvgPool (low-pass) + 1x1 conv (channel map)
+        self.skip = nn.Sequential(
+            nn.AvgPool1d(kernel_size=stride, stride=stride),
+            WNConv1d(in_channels, out_channels, kernel_size=1),
+        )
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.block(x)
+        h = self.block(x)
+        s = self.skip(x)
+        # Align lengths (AvgPool and strided conv may differ by ±1)
+        min_len = min(h.shape[-1], s.shape[-1])
+        return h[:, :, :min_len] + s[:, :, :min_len]
 
 
-# ─── Decoder Block (sub-pixel, no shortcut) ─────────────────
+# ─── Decoder Block (sub-pixel + nearest skip) ───────────────
 
 
 class DecoderBlock(nn.Module):
-    """SnakeBeta → sub-pixel upsample (Conv + pixel_shuffle) → 3x DilatedResUnit.
+    """SnakeBeta → sub-pixel upsample → 3x DilatedResUnit + nearest skip.
 
-    No shortcut, no ConvTranspose. Zero aliasing from upsampling.
+    Skip: nearest upsample + 1x1 Conv. No ConvTranspose aliasing.
     """
 
     def __init__(
@@ -131,18 +140,29 @@ class DecoderBlock(nn.Module):
         expanded = out_channels * stride
         self.stride = stride
 
-        self.block = nn.Sequential(
-            SnakeBeta(in_channels),
-            WNConv1d(in_channels, expanded, kernel_size=3, padding=1),
-        )
+        # Main path: sub-pixel upsample
+        self.act = SnakeBeta(in_channels)
+        self.upsample_conv = WNConv1d(in_channels, expanded, kernel_size=3, padding=1)
         self.res_units = nn.Sequential(*[
             DilatedResUnit(out_channels, d, kernel_size) for d in dilations
         ])
 
+        # Skip: nearest upsample + 1x1 conv
+        self.skip_conv = WNConv1d(in_channels, out_channels, kernel_size=1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.block(x)  # [B, out_ch*stride, T]
-        h = pixel_shuffle_1d(h, self.stride)  # [B, out_ch, T*stride]
-        return self.res_units(h)
+        # Main path
+        h = self.act(x)
+        h = self.upsample_conv(h)
+        h = pixel_shuffle_1d(h, self.stride)
+        h = self.res_units(h)
+
+        # Skip path: nearest upsample + 1x1
+        s = F.interpolate(x, scale_factor=self.stride, mode='nearest')
+        s = self.skip_conv(s)
+
+        min_len = min(h.shape[-1], s.shape[-1])
+        return h[:, :, :min_len] + s[:, :, :min_len]
 
 
 # ─── Encoder ─────────────────────────────────────────────────
