@@ -351,6 +351,7 @@ class WavVAE(nn.Module):
     def forward(self, x: torch.Tensor) -> dict:
         z, mean, std = self.encode(x)
         x_hat = self.decode(z, output_length=x.shape[-1])
+        x_hat = x_hat.clamp(-1.0, 1.0)
         reg_loss = self.bottleneck.reg_loss(mean, std)
         return {
             "x_hat": x_hat,
