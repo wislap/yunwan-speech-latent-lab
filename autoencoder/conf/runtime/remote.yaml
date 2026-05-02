@@ -1,7 +1,29 @@
-project_root: /root/autodl-tmp/project
+# ─── 远程服务器 (AutoDL 5090) ────────────────────────────────
+#
+# autodl-fs (200GB, 持久, 网络盘, 小文件慢):
+#   /root/autodl-fs/wav-vae/
+#     code/          项目代码 (少量文件, 读写 OK)
+#     checkpoints/   最佳模型存档 (少量大文件)
+#
+# autodl-tmp (50GB, 随实例释放, 本地 SSD, 快):
+#   /root/autodl-tmp/wav-vae/
+#     data/          数据集 (大量小文件, 必须本地盘)
+#     runs/          训练输出
+# ─────────────────────────────────────────────────────────────
+
+project_root: /root/autodl-fs/wav-vae/code
 python_bin: /root/miniconda3/bin/python
 cuda_device: 0
-data_path: /root/autodl-tmp/project/data/ljspeech_train_splits.json
-eval_data_path: /root/autodl-tmp/project/data/ljspeech_train_splits.json
+
+# 数据 (本地快盘)
+data_path: /root/autodl-tmp/wav-vae/data/ljspeech_chunks/manifest.json
+eval_data_path: /root/autodl-tmp/wav-vae/data/ljspeech_val.json
+
+# 输出 (本地快盘)
+output_root: /root/autodl-tmp/wav-vae/runs
+
+# 存档 (持久盘)
+checkpoint_archive: /root/autodl-fs/wav-vae/checkpoints
+
 site_tag: remote
 role_tag: main

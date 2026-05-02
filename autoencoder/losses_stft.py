@@ -74,17 +74,17 @@ class MultiResolutionSTFTLoss(nn.Module):
 
 
 class MultiBandSTFTLoss(nn.Module):
-    """多频段独立 STFT 损失
+    """多频段独立 STFT 损失 (V14.6: 带高频加权)
     
     将频谱分成多个子带，每个子带独立计算 spectral convergence + log mag loss，
-    然后等权求和。避免低频能量主导全局 loss，让中高频获得足够梯度。
+    按 band_weights 加权求和。高频 band 给更大权重，补偿时域模型的高频弱势。
     
-    默认频段 (针对 decoder Nyquist 频率设计):
-      Band 0: 0-500Hz     (基频区)
-      Band 1: 500-1500Hz  (Stage 1 Nyquist = 1500Hz)
-      Band 2: 1500-3500Hz (Stage 1 imaging 区)
-      Band 3: 3500-6000Hz (Stage 2 Nyquist = 6000Hz)
-      Band 4: 6000-12000Hz (高频区)
+    默认频段 (22050Hz):
+      Band 0: 0-500Hz      (基频区)         weight=1.0
+      Band 1: 500-1500Hz   (低中频)         weight=1.0
+      Band 2: 1500-3500Hz  (中频)           weight=1.5
+      Band 3: 3500-6000Hz  (中高频, 弱势区)  weight=2.5
+      Band 4: 6000-11025Hz (高频, 最弱)      weight=3.0
     """
     
     def __init__(
@@ -94,6 +94,7 @@ class MultiBandSTFTLoss(nn.Module):
         win_size: int = 2048,
         sr: int = 24000,
         band_edges_hz: list = [0, 500, 1500, 3500, 6000, 12000],
+        band_weights: list | None = None,
         complex_weight: float = 1.0,
     ):
         super().__init__()
@@ -114,6 +115,16 @@ class MultiBandSTFTLoss(nn.Module):
             self.band_slices.append((lo_bin, hi_bin))
         
         self.n_bands = len(self.band_slices)
+        
+        # Band weights: 默认等权, 可配置高频加权
+        if band_weights is not None:
+            assert len(band_weights) == self.n_bands, \
+                f"band_weights length {len(band_weights)} != n_bands {self.n_bands}"
+            self.band_weights = band_weights
+        else:
+            self.band_weights = [1.0] * self.n_bands
+        
+        self._weight_sum = sum(self.band_weights)
     
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         # 强制 FP32: torch.stft 在 FP16 下中间值易溢出
@@ -133,14 +144,14 @@ class MultiBandSTFTLoss(nn.Module):
         y_mag = torch.abs(y_stft)
         
         total_loss = 0.0
-        for lo, hi in self.band_slices:
+        for band_idx, (lo, hi) in enumerate(self.band_slices):
             x_band = x_mag[:, lo:hi, :]
             y_band = y_mag[:, lo:hi, :]
             
             # Spectral convergence (per-band, 独立归一化)
-            sc = torch.norm(y_band - x_band, p="fro") / (torch.norm(y_band, p="fro") + 1e-4)
-            # Log magnitude (per-band)  [eps=1e-4: FP16 safe]
-            log_l = F.l1_loss(torch.log(x_band + 1e-4), torch.log(y_band + 1e-4))
+            sc = torch.norm(y_band - x_band, p="fro") / (torch.norm(y_band, p="fro").detach() + 1e-4)
+            # Log magnitude (per-band)
+            log_l = F.l1_loss(torch.log(x_band + 1e-5), torch.log(y_band + 1e-5))
             
             band_loss = sc + log_l
             
@@ -154,9 +165,9 @@ class MultiBandSTFTLoss(nn.Module):
                 )
                 band_loss = band_loss + self.complex_weight * complex_l
             
-            total_loss = total_loss + band_loss
+            total_loss = total_loss + self.band_weights[band_idx] * band_loss
         
-        return total_loss / self.n_bands
+        return total_loss / self._weight_sum
 
 
 class MultiResolutionMultiBandSTFTLoss(nn.Module):
@@ -172,6 +183,7 @@ class MultiResolutionMultiBandSTFTLoss(nn.Module):
         win_sizes: list = [512, 1024, 2048],
         sr: int = 24000,
         band_edges_hz: list = [0, 500, 1500, 3500, 6000, 12000],
+        band_weights: list | None = None,
         complex_weight: float = 1.0,
     ):
         super().__init__()
@@ -179,6 +191,7 @@ class MultiResolutionMultiBandSTFTLoss(nn.Module):
             MultiBandSTFTLoss(
                 fft_size=f, hop_size=h, win_size=w,
                 sr=sr, band_edges_hz=band_edges_hz,
+                band_weights=band_weights,
                 complex_weight=complex_weight,
             )
             for f, h, w in zip(fft_sizes, hop_sizes, win_sizes)

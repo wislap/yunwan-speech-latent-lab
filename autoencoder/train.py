@@ -25,10 +25,11 @@ import torchaudio
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 
-from autoencoder.losses_stft import MultiResolutionSTFTLoss
+from autoencoder.losses_stft import MultiResolutionSTFTLoss, MultiResolutionMultiBandSTFTLoss
 from autoencoder.losses import MultiScaleMelLoss, compute_reconstruction_loss
 from autoencoder.models.autoencoder import WavVAE
 from autoencoder.models.discriminator import (
+    MultiScaleSubBandDiscriminator,
     discriminator_loss,
     feature_matching_loss,
     generator_loss,
@@ -446,6 +447,28 @@ def train(args: DictConfig) -> None:
         std_min=float(args.get("std_min", 0.1)),
         std_max=float(args.get("std_max", 1.5)),
         reg_warmup_steps=int(args.get("reg_warmup_steps", 1000)),
+        use_istft_decoder=bool(args.get("use_istft_decoder", False)),
+        istft_n_fft=int(args.get("istft_n_fft", 2048)),
+        istft_hop=int(args.get("istft_hop", 512)),
+        sr=sr,
+        use_phase_refiner=bool(args.get("use_phase_refiner", False)),
+        phase_n_fft=int(args.get("phase_n_fft", 2048)),
+        phase_hop=int(args.get("phase_hop", 512)),
+        use_vocos_decoder=bool(args.get("use_vocos_decoder", False)),
+        vocos_hidden_dim=int(args.get("vocos_hidden_dim", 1024)),
+        vocos_n_layers=int(args.get("vocos_n_layers", 8)),
+        vocos_n_fft=int(args.get("vocos_n_fft", 1024)),
+        vocos_hop=int(args.get("vocos_hop", 512)),
+        use_hybrid_decoder=bool(args.get("use_hybrid_decoder", False)),
+        hybrid_vocos_hidden=int(args.get("hybrid_vocos_hidden", 512)),
+        hybrid_vocos_layers=int(args.get("hybrid_vocos_layers", 4)),
+        hybrid_n_fft=int(args.get("hybrid_n_fft", 512)),
+        hybrid_hop=int(args.get("hybrid_hop", 128)),
+        use_dual_path_decoder=bool(args.get("use_dual_path_decoder", False)),
+        dual_vocos_hidden=int(args.get("dual_vocos_hidden", 512)),
+        dual_vocos_layers=int(args.get("dual_vocos_layers", 6)),
+        dual_n_fft=int(args.get("dual_n_fft", 1024)),
+        dual_hop=int(args.get("dual_hop", 256)),
     ).to(device)
 
     print(f"WavVAE parameters: {count_parameters(model):,}")
@@ -461,16 +484,33 @@ def train(args: DictConfig) -> None:
         print(f"  Loading teacher checkpoint: {teacher_ckpt_path}")
         teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device, weights_only=False)
         teacher_state = teacher_ckpt["model"]
-        # Try full model load first, fall back to encoder-only
+        # Try full model load first, fall back to partial with key remapping
         try:
             model.load_state_dict(teacher_state)
             print(f"  Loaded full model ({len(teacher_state)} keys)")
-        except RuntimeError:
-            partial_state = {k: v for k, v in teacher_state.items()
-                             if k.startswith("encoder.") or k.startswith("bottleneck.")}
-            missing, unexpected = model.load_state_dict(partial_state, strict=False)
-            print(f"  Loaded {len(partial_state)} encoder/bottleneck keys, "
-                  f"{len(missing)} missing (decoder, expected)")
+        except RuntimeError as e:
+            print(f"  Full load failed, trying partial with remapping")
+            # Remap V14.4 decoder keys for DualPathDecoder
+            remapped = {}
+            for k, v in teacher_state.items():
+                new_k = k
+                if k.startswith("decoder.blocks.0."):
+                    new_k = k.replace("decoder.blocks.0.", "decoder.block0.")
+                elif k.startswith("decoder.blocks."):
+                    # decoder.blocks.N -> decoder.time_blocks.(N-1)
+                    parts = k.split(".")
+                    idx = int(parts[2])
+                    if idx >= 1:
+                        parts[1] = "time_blocks"
+                        parts[2] = str(idx - 1)
+                        new_k = ".".join(parts)
+                remapped[new_k] = v
+            
+            model_keys = set(model.state_dict().keys())
+            partial = {k: v for k, v in remapped.items() if k in model_keys}
+            missing, unexpected = model.load_state_dict(partial, strict=False)
+            print(f"  Loaded {len(partial)} matching keys, "
+                  f"{len(missing)} missing (new modules)")
 
     if freeze_encoder:
         print("  Freezing encoder and bottleneck")
@@ -478,8 +518,31 @@ def train(args: DictConfig) -> None:
             p.requires_grad = False
         for p in model.bottleneck.parameters():
             p.requires_grad = False
+        # Also freeze decoder if phase_refiner is being trained standalone
+        if bool(args.get("use_phase_refiner", False)) and bool(args.get("freeze_decoder", True)):
+            print("  Freezing decoder (phase refiner only training)")
+            for p in model.decoder.parameters():
+                p.requires_grad = False
+        # Freeze decoder.proj + block0 for hybrid decoder (only train vocos_head)
+        if bool(args.get("use_hybrid_decoder", False)) and bool(args.get("freeze_decoder_blocks", True)):
+            print("  Freezing decoder.proj + block0 (vocos head only training)")
+            for p in model.decoder.proj.parameters():
+                p.requires_grad = False
+            for p in model.decoder.block0.parameters():
+                p.requires_grad = False
+        # Freeze time-domain path for dual-path decoder (only train vocos_head)
+        if bool(args.get("use_dual_path_decoder", False)):
+            print("  Freezing time-domain path (vocos head only training)")
+            for p in model.decoder.proj.parameters():
+                p.requires_grad = False
+            for p in model.decoder.block0.parameters():
+                p.requires_grad = False
+            for p in model.decoder.time_blocks.parameters():
+                p.requires_grad = False
+            for p in model.decoder.tail.parameters():
+                p.requires_grad = False
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"  Trainable parameters (decoder only): {trainable:,}")
+        print(f"  Trainable parameters: {trainable:,}")
 
     # ── torch.compile ────────────────────────────────────────
     use_compile = bool(args.get("use_compile", False))
@@ -514,6 +577,39 @@ def train(args: DictConfig) -> None:
         fft_sizes=tuple(args.mel_fft_sizes),
         n_mels_list=tuple(args.mel_n_mels),
     ).to(device)
+
+    # ── Multi-band STFT loss (V14.6+) ───────────────────────
+    mb_stft_enable = bool(args.get("mb_stft_enable", False))
+    mb_stft_loss_fn = None
+    mb_stft_weight = float(args.get("mb_stft_weight", 1.0))
+    if mb_stft_enable:
+        mb_stft_loss_fn = MultiResolutionMultiBandSTFTLoss(
+            fft_sizes=list(args.get("mb_stft_fft_sizes", [1024, 2048])),
+            hop_sizes=list(args.get("mb_stft_hop_sizes", [256, 512])),
+            win_sizes=list(args.get("mb_stft_win_sizes", [1024, 2048])),
+            sr=sr,
+            band_edges_hz=list(args.get("mb_stft_band_edges", [0, 500, 1500, 3500, 6000, 11025])),
+            band_weights=list(args.get("mb_stft_band_weights", [1.0, 1.0, 1.5, 2.5, 3.0])),
+            complex_weight=float(args.get("mb_stft_complex_weight", 0.5)),
+        ).to(device)
+        print(f"  Multi-band STFT loss: weight={mb_stft_weight}, "
+              f"bands={list(args.get('mb_stft_band_edges', [0, 500, 1500, 3500, 6000, 11025]))}, "
+              f"band_weights={list(args.get('mb_stft_band_weights', [1.0, 1.0, 1.5, 2.5, 3.0]))}")
+
+    # ── Sub-band discriminator (V14.6+) ─────────────────────
+    subband_disc_enable = bool(args.get("subband_disc_enable", False))
+    subband_disc = None
+    if subband_disc_enable:
+        subband_disc = MultiScaleSubBandDiscriminator(
+            n_ffts=list(args.get("subband_disc_n_ffts", [1024, 2048])),
+            hop_lengths=list(args.get("subband_disc_hop_lengths", [256, 512])),
+            win_lengths=list(args.get("subband_disc_win_lengths", [1024, 2048])),
+            sr=sr,
+            freq_range_hz=tuple(args.get("subband_disc_freq_range", [4000, 11025])),
+            filters=int(args.get("subband_disc_filters", 32)),
+        ).to(device)
+        print(f"  Sub-band discriminator: {count_parameters(subband_disc):,} params, "
+              f"freq_range={list(args.get('subband_disc_freq_range', [4000, 11025]))}Hz")
 
     # ── Data ─────────────────────────────────────────────────
     latent_manifest = args.get("latent_manifest", None)
@@ -602,7 +698,10 @@ def train(args: DictConfig) -> None:
     g_optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), betas=(0.8, 0.99))
     d_optimizer = None
     if disc is not None:
-        d_optimizer = torch.optim.Adam(disc.parameters(), lr=float(args.adv_d_lr), betas=(0.8, 0.99))
+        d_params = list(disc.parameters())
+        if subband_disc is not None:
+            d_params += list(subband_disc.parameters())
+        d_optimizer = torch.optim.Adam(d_params, lr=float(args.adv_d_lr), betas=(0.8, 0.99))
 
     # LR warmup + cosine decay
     total_steps = int(args.epochs) * len(train_loader)
@@ -633,6 +732,8 @@ def train(args: DictConfig) -> None:
             g_optimizer.load_state_dict(ckpt["g_optimizer"])
         if disc is not None and "disc" in ckpt:
             disc.load_state_dict(ckpt["disc"])
+        if subband_disc is not None and "subband_disc" in ckpt:
+            subband_disc.load_state_dict(ckpt["subband_disc"])
         if d_optimizer is not None and "d_optimizer" in ckpt:
             d_optimizer.load_state_dict(ckpt["d_optimizer"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -677,6 +778,8 @@ def train(args: DictConfig) -> None:
         model.train()
         if disc is not None:
             disc.train()
+        if subband_disc is not None:
+            subband_disc.train()
 
         use_adv = adv_enable and epoch >= adv_start_epoch
         # Disc warmup: freeze AE, only train D
@@ -733,6 +836,8 @@ def train(args: DictConfig) -> None:
                     audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
                     l1_weight=l1_weight, l2_weight=l2_weight,
                     stft_weight=stft_weight, mel_weight=mel_weight,
+                    multiband_stft_loss_fn=mb_stft_loss_fn,
+                    multiband_stft_weight=mb_stft_weight,
                 )
                 g_loss = recon_losses["total"]
 
@@ -740,6 +845,7 @@ def train(args: DictConfig) -> None:
                 adv_g_loss_val = 0.0
                 fm_loss_val = 0.0
                 d_loss_val = 0.0
+                sb_adv_g_val = 0.0
 
                 if use_adv and disc is not None:
                     fake_logits, fake_features = disc(x_hat)
@@ -751,6 +857,18 @@ def train(args: DictConfig) -> None:
                     g_loss = g_loss + adv_g_weight * g_adv + adv_fm_weight * fm_loss
                     adv_g_loss_val = g_adv.item()
                     fm_loss_val = fm_loss.item()
+                    
+                    # Sub-band discriminator (高频专注)
+                    if subband_disc is not None:
+                        sb_fake_logits, sb_fake_features = subband_disc(x_hat)
+                        with torch.no_grad():
+                            _, sb_real_features = subband_disc(audio)
+                        sb_g_adv = generator_loss(sb_fake_logits)
+                        sb_fm = feature_matching_loss(sb_real_features, sb_fake_features)
+                        sb_weight = float(args.get("subband_adv_g_weight", 0.1))
+                        sb_fm_weight = float(args.get("subband_adv_fm_weight", 2.0))
+                        g_loss = g_loss + sb_weight * sb_g_adv + sb_fm_weight * sb_fm
+                        sb_adv_g_val = sb_g_adv.item()
 
             # NaN/Inf check
             if not torch.isfinite(g_loss):
@@ -788,6 +906,13 @@ def train(args: DictConfig) -> None:
                     real_logits, _ = disc(audio)
                     fake_logits, _ = disc(x_hat_d.detach())
                     d_loss = discriminator_loss(real_logits, fake_logits)
+                    
+                    # Sub-band discriminator loss
+                    if subband_disc is not None:
+                        sb_real_logits, _ = subband_disc(audio)
+                        sb_fake_logits, _ = subband_disc(x_hat_d.detach())
+                        sb_d_loss = discriminator_loss(sb_real_logits, sb_fake_logits)
+                        d_loss = d_loss + sb_d_loss
 
                 if torch.isfinite(d_loss):
                     (d_loss / grad_accum_steps).backward()
@@ -818,8 +943,12 @@ def train(args: DictConfig) -> None:
                     f"mel={recon_losses['mel'].item():.4f} "
                     f"reg={recon_losses['reg'].item():.6f})"
                 )
+                if "mb_stft" in recon_losses:
+                    msg += f" mb_stft={recon_losses['mb_stft'].item():.4f}"
                 if use_adv:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
+                    if sb_adv_g_val > 0:
+                        msg += f" sb_g={sb_adv_g_val:.4f}"
                 msg += f" | lr={lr_g:.2e}"
                 print(msg, flush=True)
 
@@ -880,6 +1009,8 @@ def train(args: DictConfig) -> None:
         }
         if disc is not None:
             save_dict["disc"] = disc.state_dict()
+        if subband_disc is not None:
+            save_dict["subband_disc"] = subband_disc.state_dict()
         if d_optimizer is not None:
             save_dict["d_optimizer"] = d_optimizer.state_dict()
         if d_scheduler is not None:

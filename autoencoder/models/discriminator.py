@@ -261,6 +261,141 @@ class CombinedDiscriminator(nn.Module):
         return logits_all, features_all
 
 
+# ─── Sub-Band STFT Discriminator ─────────────────────────────
+
+
+class SubBandSTFTDiscriminator(nn.Module):
+    """子带 STFT 判别器: 只关注指定频率范围
+    
+    对 STFT 的指定频段 bins 做 2D Conv 判别。
+    用于强化高频重建质量 (4k-11kHz)。
+    
+    和全频段 MS-STFT 判别器互补:
+    - MS-STFT: 全频段, 粗粒度
+    - SubBand: 窄频段, 细粒度, 高频专注
+    """
+    
+    def __init__(
+        self,
+        n_fft: int = 2048,
+        hop_length: int = 512,
+        win_length: int = 2048,
+        sr: int = 22050,
+        freq_range_hz: tuple[int, int] = (4000, 11025),
+        filters: int = 32,
+        kernel_size: tuple[int, int] = (3, 9),
+        stride: tuple[int, int] = (1, 2),
+        dilations: list[int] = [1, 2, 4],
+        max_filters: int = 256,
+    ):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.register_buffer("window", torch.hann_window(win_length))
+        
+        # 计算频段 bin 范围
+        hz_per_bin = sr / n_fft
+        self.bin_lo = int(freq_range_hz[0] / hz_per_bin)
+        self.bin_hi = min(int(freq_range_hz[1] / hz_per_bin), n_fft // 2 + 1)
+        n_bins = self.bin_hi - self.bin_lo
+        
+        # 2D Conv 网络 (和 STFTDiscriminator 结构类似但更小)
+        self.convs = nn.ModuleList()
+        in_ch = 2  # real + imag
+        out_ch = filters
+        
+        self.convs.append(nn.Sequential(
+            weight_norm(nn.Conv2d(
+                in_ch, out_ch, kernel_size=kernel_size,
+                padding=_get_2d_padding(kernel_size),
+            )),
+            nn.LeakyReLU(0.2),
+        ))
+        in_ch = out_ch
+        
+        for i, dilation in enumerate(dilations):
+            out_ch = min(filters * (2 ** (i + 1)), max_filters)
+            self.convs.append(nn.Sequential(
+                weight_norm(nn.Conv2d(
+                    in_ch, out_ch, kernel_size=kernel_size,
+                    stride=stride, dilation=(dilation, 1),
+                    padding=_get_2d_padding(kernel_size, (dilation, 1)),
+                )),
+                nn.LeakyReLU(0.2),
+            ))
+            in_ch = out_ch
+        
+        out_ch = min(filters * (2 ** (len(dilations) + 1)), max_filters)
+        self.convs.append(nn.Sequential(
+            weight_norm(nn.Conv2d(
+                in_ch, out_ch, kernel_size=(kernel_size[0], kernel_size[0]),
+                padding=_get_2d_padding((kernel_size[0], kernel_size[0])),
+            )),
+            nn.LeakyReLU(0.2),
+        ))
+        in_ch = out_ch
+        
+        self.conv_post = weight_norm(nn.Conv2d(
+            in_ch, 1, kernel_size=(kernel_size[0], kernel_size[0]),
+            padding=_get_2d_padding((kernel_size[0], kernel_size[0])),
+        ))
+    
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        x_1d = x.squeeze(1)
+        spec = torch.stft(
+            x_1d, self.n_fft, self.hop_length, self.win_length,
+            window=self.window, return_complex=True,
+        )
+        # 截取子带
+        spec = spec[:, self.bin_lo:self.bin_hi, :]
+        z = torch.stack([spec.real, spec.imag], dim=1)  # [B, 2, F_sub, T']
+        z = z.permute(0, 1, 3, 2)  # [B, 2, T', F_sub]
+        
+        features = []
+        for layer in self.convs:
+            z = layer(z)
+            features.append(z)
+        
+        logits = self.conv_post(z)
+        return logits, features
+
+
+class MultiScaleSubBandDiscriminator(nn.Module):
+    """多分辨率子带判别器
+    
+    在多个 STFT 分辨率上对指定频段做判别。
+    """
+    
+    def __init__(
+        self,
+        n_ffts: list[int] = [1024, 2048],
+        hop_lengths: list[int] = [256, 512],
+        win_lengths: list[int] = [1024, 2048],
+        sr: int = 22050,
+        freq_range_hz: tuple[int, int] = (4000, 11025),
+        filters: int = 32,
+    ):
+        super().__init__()
+        self.discriminators = nn.ModuleList([
+            SubBandSTFTDiscriminator(
+                n_fft=n_ffts[i], hop_length=hop_lengths[i],
+                win_length=win_lengths[i], sr=sr,
+                freq_range_hz=freq_range_hz, filters=filters,
+            )
+            for i in range(len(n_ffts))
+        ])
+    
+    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], List[List[torch.Tensor]]]:
+        logits_list = []
+        features_list = []
+        for disc in self.discriminators:
+            logits, features = disc(x)
+            logits_list.append(logits)
+            features_list.append(features)
+        return logits_list, features_list
+
+
 # ─── GAN Losses ─────────────────────────────────────────────
 
 def discriminator_loss(

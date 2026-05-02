@@ -94,10 +94,13 @@ def compute_reconstruction_loss(
     l2_weight: float = 5.0,
     stft_weight: float = 0.5,
     mel_weight: float = 0.1,
+    multiband_stft_loss_fn: nn.Module | None = None,
+    multiband_stft_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Aggregate all reconstruction losses.
 
     L1+L2 time-domain losses dominate to directly optimize waveform accuracy.
+    Optional multi-band STFT loss with high-freq weighting for V14.6+.
     """
     l1_loss = F.l1_loss(x_hat, x)
     l2_loss = F.mse_loss(x_hat, x)
@@ -111,7 +114,8 @@ def compute_reconstruction_loss(
         + mel_weight * mel_loss
         + reg_loss
     )
-    return {
+    
+    result = {
         "total": total,
         "l1": l1_loss,
         "l2": l2_loss,
@@ -119,3 +123,12 @@ def compute_reconstruction_loss(
         "mel": mel_loss,
         "reg": reg_loss,
     }
+    
+    # Multi-band STFT loss (V14.6+)
+    if multiband_stft_loss_fn is not None and multiband_stft_weight > 0:
+        mb_stft_loss = multiband_stft_loss_fn(x_hat, x)
+        total = total + multiband_stft_weight * mb_stft_loss
+        result["mb_stft"] = mb_stft_loss
+        result["total"] = total
+    
+    return result
