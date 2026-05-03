@@ -30,6 +30,7 @@ class TTSDatasetV3(Dataset):
         latent_stats_path: Optional[str] = None,
         preload_latents: bool = False,  # 预加载 latent 到内存
         preload_to_gpu: bool = False,  # 预加载到 GPU 显存
+        max_samples: Optional[int] = None,
     ):
         self.manifest_path = Path(manifest_path)
         self.max_frames = max_frames
@@ -68,6 +69,8 @@ class TTSDatasetV3(Dataset):
             item for item in self.items 
             if item.get("duration", float("inf")) >= min_frames
         ]
+        if max_samples is not None and max_samples > 0:
+            self.items = self.items[:max_samples]
         
         # 预加载 latent 到内存/显存 (预先 pad 到 max_frames)
         self.latent_cache = {}
@@ -466,6 +469,7 @@ def get_dataloader_v3(
     latent_stats_path: Optional[str] = None,
     preload_latents: bool = False,
     preload_to_gpu: bool = False,
+    max_samples: Optional[int] = None,
 ) -> DataLoader:
     """创建 v3 DataLoader"""
     dataset = TTSDatasetV3(
@@ -475,6 +479,7 @@ def get_dataloader_v3(
         latent_stats_path=latent_stats_path,
         preload_latents=preload_latents,
         preload_to_gpu=preload_to_gpu,
+        max_samples=max_samples,
     )
     
     # 如果预加载到 GPU，不需要 num_workers
@@ -492,4 +497,3 @@ def get_dataloader_v3(
         prefetch_factor=2 if num_workers > 0 else None,
         persistent_workers=num_workers > 0,
     )
-

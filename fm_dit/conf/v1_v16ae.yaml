@@ -7,6 +7,7 @@ data:
   latent_dim: 384
   max_frames: 256
   min_frames: 16
+  max_samples: null
 
 model:
   latent_dim: 384

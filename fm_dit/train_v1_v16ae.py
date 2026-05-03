@@ -75,6 +75,7 @@ def sample_flow_t(
     logit_loc: float,
     logit_scale: float,
     eps: float,
+    t_min: float,
     device: torch.device,
 ) -> torch.Tensor:
     if mode == "uniform":
@@ -86,6 +87,9 @@ def sample_flow_t(
         t = beta_dist.sample((batch_size, 1, 1)).to(device)
     else:
         raise ValueError(f"unknown t sampling mode: {mode}")
+    t = t.clamp(eps, 1.0 - eps)
+    if t_min > 0.0:
+        t = t_min + (1.0 - t_min) * t
     return t.clamp(eps, 1.0 - eps)
 
 
@@ -339,11 +343,11 @@ class FMDiTV16AE(nn.Module):
         logit_loc: float = 0.0,
         logit_scale: float = 1.0,
         t_eps: float = 1e-4,
+        t_min: float = 0.0,
         min_snr_gamma: float = 5.0,
     ):
         """训练 forward"""
-        latent_target_model = self.latent_in_proj(latent_target)
-        B, S, _ = latent_target_model.shape
+        B, S, _ = latent_target.shape
         device = latent_target.device
         valid_mask = None
         key_padding_mask = None
@@ -351,7 +355,7 @@ class FMDiTV16AE(nn.Module):
             frame_lengths = frame_lengths.to(device=device).clamp(min=1, max=S)
             valid_mask = lengths_to_valid_mask(frame_lengths, S).unsqueeze(-1)
             key_padding_mask = ~valid_mask.squeeze(-1)
-            latent_target_model = latent_target_model * valid_mask.to(dtype=latent_target_model.dtype)
+            latent_target = latent_target * valid_mask.to(dtype=latent_target.dtype)
         
         # CFG: 随机 drop 条件
         drop_cond = random.random() < self.cond_drop_prob
@@ -362,22 +366,25 @@ class FMDiTV16AE(nn.Module):
         # Flow matching: noise -> latent.
         t = sample_flow_t(
             B, t_sampling, beta_alpha, beta_beta,
-            logit_loc, logit_scale, t_eps, device,
+            logit_loc, logit_scale, t_eps, t_min, device,
         )
-        noise = torch.randn_like(latent_target_model)
+        noise = torch.randn_like(latent_target)
         if valid_mask is not None:
             noise = noise * valid_mask.to(dtype=noise.dtype)
         
-        x_t = (1 - t) * noise + t * latent_target_model
-        v_target = latent_target_model - noise
+        x_t = (1 - t) * noise + t * latent_target
+        v_target = latent_target - noise
         
-        # DiT 预测 velocity (v5.6: 只传 cond，无 context)
-        v_pred = self.dit(
-            x_t,
+        # DiT uses model_dim internally, while the flow state and loss stay in
+        # the normalized AE latent space. This trains both I/O projections when
+        # latent_dim != model_dim.
+        v_pred_model = self.dit(
+            self.latent_in_proj(x_t),
             t.squeeze(-1).squeeze(-1),
             cond,
             key_padding_mask=key_padding_mask,
         )
+        v_pred = self.latent_out_proj(v_pred_model)
         
         # Min-SNR Weighting
         t_flat = t.squeeze(-1).squeeze(-1)
@@ -435,7 +442,7 @@ class FMDiTV16AE(nn.Module):
             key_padding_mask = ~valid_mask.squeeze(-1)
             cond = cond * valid_mask.to(dtype=cond.dtype)
         
-        x = torch.randn(B, S, self.model_dim, device=device)
+        x = torch.randn(B, S, self.latent_dim, device=device)
         if valid_mask is not None:
             x = x * valid_mask.to(dtype=x.dtype)
         dt = 1.0 / n_steps
@@ -443,8 +450,9 @@ class FMDiTV16AE(nn.Module):
         if solver == "euler":
             for i in range(n_steps):
                 t = torch.full((B,), i * dt, device=device)
-                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
-                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
+                x_model = self.latent_in_proj(x)
+                v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
+                v_uncond = self.latent_out_proj(self.dit(x_model, t, uncond, key_padding_mask=key_padding_mask))
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 x = x + v * dt
                 if valid_mask is not None:
@@ -455,13 +463,15 @@ class FMDiTV16AE(nn.Module):
                 t = torch.full((B,), i * dt, device=device)
                 t_next = torch.full((B,), (i + 1) * dt, device=device)
                 
-                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
-                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
+                x_model = self.latent_in_proj(x)
+                v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
+                v_uncond = self.latent_out_proj(self.dit(x_model, t, uncond, key_padding_mask=key_padding_mask))
                 v1 = v_uncond + cfg_scale * (v_cond - v_uncond)
                 x_pred = x + v1 * dt
                 
-                v_cond = self.dit(x_pred, t_next, cond, key_padding_mask=key_padding_mask)
-                v_uncond = self.dit(x_pred, t_next, uncond, key_padding_mask=key_padding_mask)
+                x_pred_model = self.latent_in_proj(x_pred)
+                v_cond = self.latent_out_proj(self.dit(x_pred_model, t_next, cond, key_padding_mask=key_padding_mask))
+                v_uncond = self.latent_out_proj(self.dit(x_pred_model, t_next, uncond, key_padding_mask=key_padding_mask))
                 v2 = v_uncond + cfg_scale * (v_cond - v_uncond)
                 
                 x = x + 0.5 * (v1 + v2) * dt
@@ -472,8 +482,9 @@ class FMDiTV16AE(nn.Module):
             prev_v = None
             for i in range(n_steps):
                 t = torch.full((B,), i * dt, device=device)
-                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
-                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
+                x_model = self.latent_in_proj(x)
+                v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
+                v_uncond = self.latent_out_proj(self.dit(x_model, t, uncond, key_padding_mask=key_padding_mask))
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 
                 if prev_v is None:
@@ -484,13 +495,16 @@ class FMDiTV16AE(nn.Module):
                 if valid_mask is not None:
                     x = x * valid_mask.to(dtype=x.dtype)
         
-        x = self.latent_out_proj(x)
+        if valid_mask is not None:
+            x = x * valid_mask.to(dtype=x.dtype)
         # 处理 latent_std/latent_mean 可能是列表的情况 (per-dim stats)
         if isinstance(latent_std, (list, tuple)):
             latent_std = torch.tensor(latent_std, device=x.device, dtype=x.dtype).view(1, 1, -1)
         if isinstance(latent_mean, (list, tuple)):
             latent_mean = torch.tensor(latent_mean, device=x.device, dtype=x.dtype).view(1, 1, -1)
         x = x * latent_std + latent_mean
+        if valid_mask is not None:
+            x = x * valid_mask.to(dtype=x.dtype)
         return x
     
     @torch.no_grad()
@@ -528,6 +542,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-frames", type=int, default=256, help="training crop length in latent frames")
     parser.add_argument("--min-frames", type=int, default=16, help="minimum latent frames to keep a sample")
+    parser.add_argument("--max-samples", type=int, default=None, help="limit dataset size for smoke tests")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--preload", action="store_true", help="预加载 latent 到内存")
     parser.add_argument("--preload-gpu", action="store_true", help="预加载数据到 GPU 显存")
@@ -547,6 +562,7 @@ def main():
     parser.add_argument("--logit-loc", type=float, default=0.0)
     parser.add_argument("--logit-scale", type=float, default=1.0)
     parser.add_argument("--t-eps", type=float, default=1e-4)
+    parser.add_argument("--t-min", type=float, default=0.0, help="minimum training flow time for staged t warmup")
     parser.add_argument("--min-snr-gamma", type=float, default=5.0)
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--no-amp", action="store_true")
@@ -683,6 +699,7 @@ def main():
         latent_stats_path=args.stats_path,
         preload_latents=args.preload or args.preload_gpu,
         preload_to_gpu=args.preload_gpu,
+        max_samples=args.max_samples,
     )
     print(f"Train samples: {len(train_loader.dataset)}", flush=True)
     
@@ -695,7 +712,7 @@ def main():
     print(f"  phoneme_dim=512, pitch/energy_dim=128, cond_dim=512", flush=True)
     print(f"  latent_dim={args.latent_dim} (I/O), model_dim={model.model_dim} (DiT internal)", flush=True)
     print(f"  max_frames={args.max_frames}, min_frames={args.min_frames}", flush=True)
-    print(f"  t_sampling={args.t_sampling}, min_snr_gamma={args.min_snr_gamma}", flush=True)
+    print(f"  t_sampling={args.t_sampling}, t_min={args.t_min}, min_snr_gamma={args.min_snr_gamma}", flush=True)
     print(f"  batch_size={args.batch_size}, grad_accum_steps={args.grad_accum_steps}", flush=True)
     print(f"  DiT: SA + Conv (每层), 无 Cross-Attention", flush=True)
     print(f"  条件注入: 输入加法 + Per-Token AdaLN", flush=True)
@@ -738,6 +755,7 @@ def main():
                     logit_loc=args.logit_loc,
                     logit_scale=args.logit_scale,
                     t_eps=args.t_eps,
+                    t_min=args.t_min,
                     min_snr_gamma=args.min_snr_gamma,
                 )
                 loss = (loss_fm + args.dur_weight * loss_dur) / args.grad_accum_steps
@@ -793,9 +811,8 @@ def main():
                 with open(args.stats_path) as f:
                     stats = json.load(f)
                 
-                # 优先使用 global_mean/global_std (标量)
-                latent_mean = stats.get('global_mean', stats.get('mean', 0.0))
-                latent_std = stats.get('global_std', stats.get('std', 1.0))
+                latent_mean = stats.get('mean', stats.get('global_mean', 0.0))
+                latent_std = stats.get('std', stats.get('global_std', 1.0))
                 latent_pred = model.sample(
                     eval_phone, eval_pitch, eval_energy,
                     n_steps=args.sample_steps, cfg_scale=args.cfg_scale,
@@ -854,9 +871,8 @@ def main():
     frame_lengths = torch.tensor([len(item['frame_phoneme_ids'])], dtype=torch.long, device=device)
     orig_latent = torch.load(item['latent_path'], weights_only=True)
     
-    # 优先使用 global_mean/global_std (标量)
-    test_latent_mean = stats.get('global_mean', stats.get('mean', 0.0))
-    test_latent_std = stats.get('global_std', stats.get('std', 1.0))
+    test_latent_mean = stats.get('mean', stats.get('global_mean', 0.0))
+    test_latent_std = stats.get('std', stats.get('global_std', 1.0))
     
     for cfg_scale in [1.0, 1.5, 2.0]:
         latent_pred = model.sample(

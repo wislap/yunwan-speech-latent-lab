@@ -24,6 +24,7 @@ python -m fm_dit.train_v1_v16ae \
   --latent-dim 384 \
   --model-dim 512 \
   --max-frames 256 \
+  --max-samples 200 \
   --batch-size 64 \
   --t-sampling beta \
   --min-snr-gamma 5.0 \
