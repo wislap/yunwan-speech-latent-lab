@@ -24,10 +24,12 @@ docs/
 │   ├── hf_time.md
 │   └── report.md
 ├── v15/                    # V15 dual-path 实验状态
-└── v16.2/                  # V16.2 256x 边界实验与诊断图表
-    ├── 256x_time.md
-    ├── diagnostics.md
-    └── figures/
+├── v16.2/                  # V16.2 256x 边界实验与诊断图表
+│   ├── 256x_time.md
+│   ├── diagnostics.md
+│   └── figures/
+└── v16.3/                  # V16.3 256x dim384 capacity test
+    └── 384_latent.md
 ```
 
 ## 版本线

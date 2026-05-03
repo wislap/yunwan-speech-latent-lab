@@ -1,0 +1,21 @@
+{
+  "run": "V16.3",
+  "checkpoint": "outputs/models/wav_vae_v16.3_256x_dim384_time_remote_main/best.pt",
+  "checkpoint_epoch": 13,
+  "checkpoint_best_snr": 20.732428689374803,
+  "pca": "docs/v16.3/figures/latent_pca_directions/v16_3/frame_p95_pca_directions.npz",
+  "n_eval": 24,
+  "variance_scales": [
+    0.0,
+    0.005,
+    0.01,
+    0.02,
+    0.05,
+    0.1
+  ],
+  "modes": [
+    "pca",
+    "channel_iso"
+  ],
+  "noise_definition": "PCA eps_i~N(0, variance_scale*eigenvalue_i), then rotate to latent channel space"
+}

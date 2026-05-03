@@ -143,3 +143,32 @@ Important reading:
 - 9-11 kHz has weak phase coherence for both V16.1 and V16.2, so this top band should not be over-interpreted alone.
 - The best diagnostic band for articulation and sibilance is currently 3.5-9 kHz.
 - Frequency response bias is not the main problem. V16.2's magnitude ratio is close to 0 dB above 2.5 kHz, but SNR and phase metrics are worse. That suggests residual texture/noise/phase-detail error rather than a simple high-frequency rolloff.
+
+## Effective Rank
+
+Output:
+
+- [effective_rank_summary.csv](figures/effective_rank/effective_rank_summary.csv)
+- [effective_rank_summary.png](figures/effective_rank/effective_rank_summary.png)
+
+Setup:
+
+- 64 LJSpeech samples
+- first 65,536 samples per item
+- deterministic encoder output
+- latent_dim 256
+- frame-level PCA over individual latent frames
+- utterance-mean PCA over `z.mean(time)`, matching older V14-style analysis
+
+| run | stride | ckpt epoch | ckpt SNR | frame effective rank | frame 99% dims | mean effective rank | mean 99% dims | active dims |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| V16.1 | 128x | 11 | 23.21 | 125.3 | 217 | 26.3 | 53 | 256/256 |
+| V16.2 | 256x | 13 | 19.93 | 144.3 | 229 | 38.0 | 57 | 256/256 |
+
+Interpretation:
+
+- V16.2 does not show latent collapse.
+- V16.2 uses at least as many dimensions as V16.1, and by entropy rank it uses more.
+- All 256 dims are active under frame-level std > 0.1 for both runs.
+- Therefore the current 256x quality gap is not caused by low effective rank or dead latent dimensions.
+- The bottleneck is more likely temporal compression/detail allocation: V16.2 has fewer latent frames and must encode more articulation and high-frequency phase detail per frame.
