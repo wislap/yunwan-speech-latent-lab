@@ -80,6 +80,7 @@ class TTSDatasetV3(Dataset):
                 latent = torch.load(item["latent_path"], weights_only=True)
                 latent = self._to_time_channel(latent)
                 T = latent.shape[0]
+                frame_length = min(T, max_frames)
                 if T > max_frames:
                     latent = latent[:max_frames]
                     T = max_frames
@@ -131,6 +132,7 @@ class TTSDatasetV3(Dataset):
                     "frame_position": frame_position,
                     "phoneme_ids": phoneme_ids,
                     "phoneme_durations": phoneme_durations,
+                    "frame_length": frame_length,
                 }
             print(f"Preloaded {len(self.latent_cache)} samples")
     
@@ -154,6 +156,7 @@ class TTSDatasetV3(Dataset):
                 "frame_position": cond["frame_position"],    # v4.7
                 "phoneme_ids": cond["phoneme_ids"],
                 "phoneme_durations": cond["phoneme_durations"],
+                "frame_length": cond.get("frame_length", self.latent_cache[item["id"]].shape[0]),
             }
         
         # 加载 latent (从缓存或文件)
@@ -223,6 +226,7 @@ class TTSDatasetV3(Dataset):
             "energy": energy,                       # [T]
             "frame_duration": frame_duration,       # [T] v4.7: 每帧所属 phoneme 的总时长
             "frame_position": frame_position,       # [T] v4.7: 每帧在 phoneme 内的相对位置
+            "frame_length": T,
         }
     
     def _expand_phonemes(
@@ -370,7 +374,7 @@ def collate_fn_v3(batch: list[dict]) -> dict:
             "energy": torch.stack([item["energy"] for item in batch]),
             "frame_duration": torch.stack([item["frame_duration"] for item in batch]),
             "frame_position": torch.stack([item["frame_position"] for item in batch]),
-            "frame_lengths": torch.tensor([first_T] * len(batch), device=device),
+            "frame_lengths": torch.tensor([item.get("frame_length", first_T) for item in batch], device=device),
             "phoneme_lengths": torch.tensor([len(item["phoneme_ids"]) for item in batch], device=device),
         }
     
@@ -489,46 +493,3 @@ def get_dataloader_v3(
         persistent_workers=num_workers > 0,
     )
 
-
-def test_dataset_v3():
-    """测试 v3 数据集"""
-    dataset = TTSDatasetV3(
-        manifest_path="data/ljspeech_duration_asr/train.json",
-        latent_stats_path="data/ljspeech_duration_asr/latent_stats.json",
-    )
-    
-    print(f"Dataset size: {len(dataset)}")
-    
-    item = dataset[0]
-    print(f"\nSample 0:")
-    print(f"  latent: {item['latent'].shape}")
-    print(f"  phoneme_ids: {item['phoneme_ids'].shape}")
-    print(f"  phoneme_durations: {item['phoneme_durations'].shape}")
-    print(f"  frame_phoneme_ids: {item['frame_phoneme_ids'].shape}")
-    print(f"  pitch: {item['pitch'].shape}")
-    print(f"  energy: {item['energy'].shape}")
-    print(f"  sum(durations): {item['phoneme_durations'].sum():.0f}")
-    
-    # 测试 DataLoader
-    loader = get_dataloader_v3(
-        manifest_path="data/ljspeech_duration_asr/train.json",
-        latent_stats_path="data/ljspeech_duration_asr/latent_stats.json",
-        batch_size=4,
-    )
-    
-    batch = next(iter(loader))
-    print(f"\nBatch:")
-    print(f"  latent: {batch['latent'].shape}")
-    print(f"  phoneme_ids: {batch['phoneme_ids'].shape}")
-    print(f"  phoneme_durations: {batch['phoneme_durations'].shape}")
-    print(f"  frame_phoneme_ids: {batch['frame_phoneme_ids'].shape}")
-    print(f"  pitch: {batch['pitch'].shape}")
-    print(f"  energy: {batch['energy'].shape}")
-    print(f"  frame_lengths: {batch['frame_lengths']}")
-    print(f"  phoneme_lengths: {batch['phoneme_lengths']}")
-    
-    print("\nTest passed!")
-
-
-if __name__ == "__main__":
-    test_dataset_v3()

@@ -12,15 +12,40 @@ model:
   latent_dim: 384
   model_dim: 512
   cond_dim: 512
-  dit_layers: 8
+  dit_dim_ff: 2048
+  dit_heads: 8
+  cond_drop_prob: 0.1
+  duration_predictor: true
 
 training:
   batch_size: 64
+  grad_accum_steps: 1
   learning_rate: 5.0e-4
   min_learning_rate: 1.0e-5
+  weight_decay: 0.01
+  warmup_steps: 500
+  grad_clip: 1.0
   steps: 30000
+  log_interval: 500
+  save_interval: 5000
   eval_interval: 1000
+  amp_dtype: bf16
+  seed: 42
+
+flow:
+  t_sampling: beta
+  beta_alpha: 2.0
+  beta_beta: 2.0
+  logit_loc: 0.0
+  logit_scale: 1.0
+  t_eps: 1.0e-4
+  min_snr_gamma: 5.0
+
+sampling:
+  steps: 6
+  solver: dpm2
+  cfg_scale: 1.5
+  eval_frames: 256
 
 output:
   dir: outputs/fm_dit/v1_v16ae
-

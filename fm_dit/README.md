@@ -25,6 +25,8 @@ python -m fm_dit.train_v1_v16ae \
   --model-dim 512 \
   --max-frames 256 \
   --batch-size 64 \
+  --t-sampling beta \
+  --min-snr-gamma 5.0 \
   --steps 2000
 ```
 
@@ -46,6 +48,20 @@ Latents should be saved as `[C, T]` or `[T, C]` tensors. The dataset normalizes
 with per-channel `mean`/`std` when available, falling back to scalar
 `global_mean`/`global_std`.
 
+The dataloader returns `frame_lengths`; training uses it to mask padded frames
+in both self-attention and flow-matching loss. This is important for V16 AE
+latents because sequence lengths vary substantially after random cropping and
+padding.
+
+## Model Layout
+
+- `models/embeddings.py`: timestep and RoPE utilities.
+- `models/attention.py`: RoPE self-attention with padding masks.
+- `models/layers.py`: SwiGLU, lightweight conv and skip layers.
+- `models/blocks.py`: reusable DiT encoder/decoder blocks.
+- `models/dit_head_v5_10.py`: the current v1 flow head assembled from those
+  components.
+
 ## Research Notes
 
 Do not judge this branch with latent cosine alone. The useful evaluation stack
@@ -55,4 +71,3 @@ is:
 - PCA-subspace residual analysis using the V16.3 p95 directions,
 - AE-decoded audio SNR, multi-band SNR, frequency response and phase coherence,
 - fixed validation cases with local time-error curves.
-

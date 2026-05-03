@@ -21,6 +21,8 @@ rather than rebuilding the codec.
 - No 12.5fps assumption.
 - Training window is explicit via `--max-frames`.
 - Dataset normalization supports per-channel latent stats.
+- `frame_lengths` masks padded frames in attention, global condition pooling,
+  sampling and FM loss.
 - Evaluation should decode through the V16 AE decoder, not stop at latent
   cosine correlation.
 
@@ -32,4 +34,3 @@ Use V16.3 exported LJSpeech latents with:
 - `model_dim=512`
 - `max_frames=256`
 - small step count first, then scale to `512` frames if memory allows.
-

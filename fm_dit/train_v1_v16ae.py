@@ -7,9 +7,9 @@ frame-window controls needed for the higher-rate V16.3 latent stream.
 """
 
 import argparse
+import json
 import math
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -53,6 +53,40 @@ def sample_logit_normal(batch_size: int, loc: float = 0.0, scale: float = 1.0, d
     """
     z = torch.randn(batch_size, device=device) * scale + loc
     return torch.sigmoid(z)
+
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def lengths_to_valid_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    positions = torch.arange(max_len, device=lengths.device)
+    return positions.unsqueeze(0) < lengths.unsqueeze(1)
+
+
+def sample_flow_t(
+    batch_size: int,
+    mode: str,
+    beta_alpha: float,
+    beta_beta: float,
+    logit_loc: float,
+    logit_scale: float,
+    eps: float,
+    device: torch.device,
+) -> torch.Tensor:
+    if mode == "uniform":
+        t = torch.rand(batch_size, 1, 1, device=device)
+    elif mode == "logit_normal":
+        t = sample_logit_normal(batch_size, loc=logit_loc, scale=logit_scale, device=device).view(batch_size, 1, 1)
+    elif mode == "beta":
+        beta_dist = torch.distributions.Beta(beta_alpha, beta_beta)
+        t = beta_dist.sample((batch_size, 1, 1)).to(device)
+    else:
+        raise ValueError(f"unknown t sampling mode: {mode}")
+    return t.clamp(eps, 1.0 - eps)
 
 
 class DropPath(nn.Module):
@@ -162,18 +196,12 @@ class CNNDurationPredictor(nn.Module):
         return duration
 
 
-class SimpleDiTv6(nn.Module):
-    """DiT v6: 25fps + 窗口翻倍
-    
-    基于 v5.6 的改进:
-    1. 时间步采样: Beta(0.5, 0.5) -> Logit-Normal(0, 1)
-       - 更多关注中间困难区域 (t≈0.3-0.7)
-       - 高频细节"浮现"的关键阶段
-    
-    继承 v5.6 特性:
-    1. 去除所有 Cross-Attention
-    2. 帧级条件直接加到输入
-    3. 每层都有 Conv
+class FMDiTV16AE(nn.Module):
+    """Frame-conditioned DiT wrapper for V16 AE latent flow.
+
+    The head is inherited from the stable v5.10 DiT recipe, while this wrapper
+    owns V16-specific conditioning, masking, flow-time sampling and latent
+    input/output projection.
     """
     
     def __init__(
@@ -185,10 +213,8 @@ class SimpleDiTv6(nn.Module):
         cond_dim: int = 512,
         latent_dim: int = 512,
         model_dim: int | None = None,
-        dit_n_layers: int = 8,
         dit_dim_ff: int = 2048,
         dit_n_heads: int = 8,
-        dit_window_size: int = 32,
         cond_drop_prob: float = 0.1,
         use_duration_predictor: bool = True,
     ):
@@ -306,36 +332,67 @@ class SimpleDiTv6(nn.Module):
         energy: torch.Tensor,
         phoneme_ids: torch.Tensor = None,
         gt_duration: torch.Tensor = None,
+        frame_lengths: torch.Tensor | None = None,
+        t_sampling: str = "beta",
+        beta_alpha: float = 2.0,
+        beta_beta: float = 2.0,
+        logit_loc: float = 0.0,
+        logit_scale: float = 1.0,
+        t_eps: float = 1e-4,
+        min_snr_gamma: float = 5.0,
     ):
         """训练 forward"""
         latent_target_model = self.latent_in_proj(latent_target)
         B, S, _ = latent_target_model.shape
         device = latent_target.device
+        valid_mask = None
+        key_padding_mask = None
+        if frame_lengths is not None:
+            frame_lengths = frame_lengths.to(device=device).clamp(min=1, max=S)
+            valid_mask = lengths_to_valid_mask(frame_lengths, S).unsqueeze(-1)
+            key_padding_mask = ~valid_mask.squeeze(-1)
+            latent_target_model = latent_target_model * valid_mask.to(dtype=latent_target_model.dtype)
         
         # CFG: 随机 drop 条件
         drop_cond = random.random() < self.cond_drop_prob
         cond = self.encode_cond(frame_phoneme_ids, pitch, energy, drop_cond=drop_cond)
+        if valid_mask is not None:
+            cond = cond * valid_mask.to(dtype=cond.dtype)
         
-        # Flow matching with Beta(2, 2) sampling
-        # Beta(2,2) 是钟形分布，中间多、两端少，比 Beta(0.5,0.5) 更平滑
-        beta_dist = torch.distributions.Beta(2.0, 2.0)
-        t = beta_dist.sample((B, 1, 1)).to(device)
+        # Flow matching: noise -> latent.
+        t = sample_flow_t(
+            B, t_sampling, beta_alpha, beta_beta,
+            logit_loc, logit_scale, t_eps, device,
+        )
         noise = torch.randn_like(latent_target_model)
+        if valid_mask is not None:
+            noise = noise * valid_mask.to(dtype=noise.dtype)
         
         x_t = (1 - t) * noise + t * latent_target_model
         v_target = latent_target_model - noise
         
         # DiT 预测 velocity (v5.6: 只传 cond，无 context)
-        v_pred = self.dit(x_t, t.squeeze(-1).squeeze(-1), cond)
+        v_pred = self.dit(
+            x_t,
+            t.squeeze(-1).squeeze(-1),
+            cond,
+            key_padding_mask=key_padding_mask,
+        )
         
         # Min-SNR Weighting
         t_flat = t.squeeze(-1).squeeze(-1)
         snr = t_flat / (1 - t_flat + 1e-8)
-        weight = torch.clamp(snr, max=5.0) / (snr + 1e-8)
+        weight = torch.clamp(snr, max=min_snr_gamma) / (snr + 1e-8)
         weight = weight.view(B, 1, 1)
         
         # Weighted MSE loss
-        mse_per_sample = ((v_pred - v_target) ** 2).mean(dim=(1, 2))
+        sq_err = (v_pred - v_target) ** 2
+        if valid_mask is not None:
+            sq_err = sq_err * valid_mask.to(dtype=sq_err.dtype)
+            denom = valid_mask.sum(dim=(1, 2)).to(dtype=sq_err.dtype).clamp_min(1.0) * sq_err.shape[-1]
+            mse_per_sample = sq_err.sum(dim=(1, 2)) / denom
+        else:
+            mse_per_sample = sq_err.mean(dim=(1, 2))
         loss_fm = (weight.squeeze() * mse_per_sample).mean()
         
         # Duration Predictor 辅助任务
@@ -362,6 +419,7 @@ class SimpleDiTv6(nn.Module):
         latent_mean: float = 0.0,
         latent_std: float = 1.0,
         solver: str = "dpm2",
+        frame_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """推理采样"""
         B, S = frame_phoneme_ids.shape
@@ -369,40 +427,53 @@ class SimpleDiTv6(nn.Module):
         
         cond = self.encode_cond(frame_phoneme_ids, pitch, energy)
         uncond = torch.zeros_like(cond)
+        key_padding_mask = None
+        valid_mask = None
+        if frame_lengths is not None:
+            frame_lengths = frame_lengths.to(device=device).clamp(min=1, max=S)
+            valid_mask = lengths_to_valid_mask(frame_lengths, S).unsqueeze(-1)
+            key_padding_mask = ~valid_mask.squeeze(-1)
+            cond = cond * valid_mask.to(dtype=cond.dtype)
         
         x = torch.randn(B, S, self.model_dim, device=device)
+        if valid_mask is not None:
+            x = x * valid_mask.to(dtype=x.dtype)
         dt = 1.0 / n_steps
         
         if solver == "euler":
             for i in range(n_steps):
                 t = torch.full((B,), i * dt, device=device)
-                v_cond = self.dit(x, t, cond)
-                v_uncond = self.dit(x, t, uncond)
+                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
+                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 x = x + v * dt
+                if valid_mask is not None:
+                    x = x * valid_mask.to(dtype=x.dtype)
                 
         elif solver == "heun":
             for i in range(n_steps):
                 t = torch.full((B,), i * dt, device=device)
                 t_next = torch.full((B,), (i + 1) * dt, device=device)
                 
-                v_cond = self.dit(x, t, cond)
-                v_uncond = self.dit(x, t, uncond)
+                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
+                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
                 v1 = v_uncond + cfg_scale * (v_cond - v_uncond)
                 x_pred = x + v1 * dt
                 
-                v_cond = self.dit(x_pred, t_next, cond)
-                v_uncond = self.dit(x_pred, t_next, uncond)
+                v_cond = self.dit(x_pred, t_next, cond, key_padding_mask=key_padding_mask)
+                v_uncond = self.dit(x_pred, t_next, uncond, key_padding_mask=key_padding_mask)
                 v2 = v_uncond + cfg_scale * (v_cond - v_uncond)
                 
                 x = x + 0.5 * (v1 + v2) * dt
+                if valid_mask is not None:
+                    x = x * valid_mask.to(dtype=x.dtype)
                 
         else:  # dpm2
             prev_v = None
             for i in range(n_steps):
                 t = torch.full((B,), i * dt, device=device)
-                v_cond = self.dit(x, t, cond)
-                v_uncond = self.dit(x, t, uncond)
+                v_cond = self.dit(x, t, cond, key_padding_mask=key_padding_mask)
+                v_uncond = self.dit(x, t, uncond, key_padding_mask=key_padding_mask)
                 v = v_uncond + cfg_scale * (v_cond - v_uncond)
                 
                 if prev_v is None:
@@ -410,6 +481,8 @@ class SimpleDiTv6(nn.Module):
                 else:
                     x = x + (1.5 * v - 0.5 * prev_v) * dt
                 prev_v = v
+                if valid_mask is not None:
+                    x = x * valid_mask.to(dtype=x.dtype)
         
         x = self.latent_out_proj(x)
         # 处理 latent_std/latent_mean 可能是列表的情况 (per-dim stats)
@@ -443,7 +516,12 @@ def main():
     parser.add_argument("--steps", type=int, default=30000)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--min-lr", type=float, default=1e-5)
-    parser.add_argument("--dit-layers", type=int, default=8)
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--warmup-steps", type=int, default=500)
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
+    parser.add_argument("--dit-dim-ff", type=int, default=2048)
+    parser.add_argument("--dit-heads", type=int, default=8)
     parser.add_argument("--cond-drop-prob", type=float, default=0.1)
     parser.add_argument("--dur-weight", type=float, default=0.1)
     parser.add_argument("--no-duration-predictor", action="store_true")
@@ -455,18 +533,38 @@ def main():
     parser.add_argument("--preload-gpu", action="store_true", help="预加载数据到 GPU 显存")
     parser.add_argument("--resume", type=str, default=None, help="从 checkpoint 继续训练")
     parser.add_argument("--resume-lr-boost", type=float, default=1.0, help="续训时学习率倍数")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log-interval", type=int, default=500)
+    parser.add_argument("--save-interval", type=int, default=5000)
     parser.add_argument("--eval-interval", type=int, default=1000, help="评估间隔 (steps)")
+    parser.add_argument("--eval-frames", type=int, default=256)
+    parser.add_argument("--sample-steps", type=int, default=6)
+    parser.add_argument("--sample-solver", type=str, default="dpm2", choices=["euler", "heun", "dpm2"])
+    parser.add_argument("--cfg-scale", type=float, default=1.5)
+    parser.add_argument("--t-sampling", type=str, default="beta", choices=["beta", "uniform", "logit_normal"])
+    parser.add_argument("--beta-alpha", type=float, default=2.0)
+    parser.add_argument("--beta-beta", type=float, default=2.0)
+    parser.add_argument("--logit-loc", type=float, default=0.0)
+    parser.add_argument("--logit-scale", type=float, default=1.0)
+    parser.add_argument("--t-eps", type=float, default=1e-4)
+    parser.add_argument("--min-snr-gamma", type=float, default=5.0)
+    parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16"])
+    parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
     
+    set_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}", flush=True)
     
     # 构建模型
-    model = SimpleDiTv6(
+    model = FMDiTV16AE(
         vocab_size=256,
-        dit_n_layers=8,
         latent_dim=args.latent_dim,
         model_dim=args.model_dim,
+        dit_dim_ff=args.dit_dim_ff,
+        dit_n_heads=args.dit_heads,
+        cond_drop_prob=args.cond_drop_prob,
+        use_duration_predictor=not args.no_duration_predictor,
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters())
@@ -530,16 +628,16 @@ def main():
         optimizer = AdamW([
             {'params': cond_params, 'lr': args.lr * args.cond_encoder_lr_mult},
             {'params': other_params, 'lr': args.lr},
-        ], weight_decay=0.01)
+        ], weight_decay=args.weight_decay)
         print(f"  Condition encoder LR: {args.lr * args.cond_encoder_lr_mult:.2e}")
     else:
-        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=0.01)
+        optimizer = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.weight_decay)
     
     # 学习率调度器
-    warmup_steps = min(500, args.steps // 10)
+    warmup_steps = min(args.warmup_steps, args.steps // 2)
     def lr_lambda(step):
         if step < warmup_steps:
-            return step / warmup_steps
+            return max(1, step) / max(1, warmup_steps)
         progress = (step - warmup_steps) / (args.steps - warmup_steps)
         cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
         min_ratio = args.min_lr / args.lr
@@ -570,6 +668,7 @@ def main():
         "fm_loss": [],
         "dur_loss": [],
         "correlation": [],
+        "latent_mse": [],
         "lr": [],
     }
     
@@ -596,6 +695,8 @@ def main():
     print(f"  phoneme_dim=512, pitch/energy_dim=128, cond_dim=512", flush=True)
     print(f"  latent_dim={args.latent_dim} (I/O), model_dim={model.model_dim} (DiT internal)", flush=True)
     print(f"  max_frames={args.max_frames}, min_frames={args.min_frames}", flush=True)
+    print(f"  t_sampling={args.t_sampling}, min_snr_gamma={args.min_snr_gamma}", flush=True)
+    print(f"  batch_size={args.batch_size}, grad_accum_steps={args.grad_accum_steps}", flush=True)
     print(f"  DiT: SA + Conv (每层), 无 Cross-Attention", flush=True)
     print(f"  条件注入: 输入加法 + Per-Token AdaLN", flush=True)
     print(f"  LR: {args.lr} -> {args.min_lr} (warmup={warmup_steps})", flush=True)
@@ -605,42 +706,56 @@ def main():
     t0 = time.time()
     running_loss_fm = 0.0
     running_loss_dur = 0.0
+    running_micro = 0
+    amp_enabled = device == "cuda" and not args.no_amp
+    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
     
     for step in range(start_step, args.steps):
-        try:
-            batch = next(data_iter)
-        except StopIteration:
-            data_iter = iter(train_loader)
-            batch = next(data_iter)
-        
-        latent = batch["latent"].to(device, non_blocking=True)
-        frame_phoneme_ids = batch["frame_phoneme_ids"].to(device, non_blocking=True)
-        pitch = batch["pitch"].to(device, non_blocking=True)
-        energy = batch["energy"].to(device, non_blocking=True)
-        phoneme_ids = batch["phoneme_ids"].to(device, non_blocking=True)
-        gt_duration = batch["phoneme_durations"].to(device, non_blocking=True)
-        
-        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-            loss_fm, loss_dur = model(
-                latent, frame_phoneme_ids, pitch, energy,
-                phoneme_ids, gt_duration,
-            )
-            loss = loss_fm + args.dur_weight * loss_dur
-        
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        for _micro in range(args.grad_accum_steps):
+            try:
+                batch = next(data_iter)
+            except StopIteration:
+                data_iter = iter(train_loader)
+                batch = next(data_iter)
+            
+            latent = batch["latent"].to(device, non_blocking=True)
+            frame_phoneme_ids = batch["frame_phoneme_ids"].to(device, non_blocking=True)
+            pitch = batch["pitch"].to(device, non_blocking=True)
+            energy = batch["energy"].to(device, non_blocking=True)
+            phoneme_ids = batch["phoneme_ids"].to(device, non_blocking=True)
+            gt_duration = batch["phoneme_durations"].to(device, non_blocking=True)
+            frame_lengths = batch["frame_lengths"].to(device, non_blocking=True)
+            
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
+                loss_fm, loss_dur = model(
+                    latent, frame_phoneme_ids, pitch, energy,
+                    phoneme_ids, gt_duration,
+                    frame_lengths=frame_lengths,
+                    t_sampling=args.t_sampling,
+                    beta_alpha=args.beta_alpha,
+                    beta_beta=args.beta_beta,
+                    logit_loc=args.logit_loc,
+                    logit_scale=args.logit_scale,
+                    t_eps=args.t_eps,
+                    min_snr_gamma=args.min_snr_gamma,
+                )
+                loss = (loss_fm + args.dur_weight * loss_dur) / args.grad_accum_steps
+            
+            loss.backward()
+            running_loss_fm += loss_fm.item()
+            running_loss_dur += loss_dur.item()
+            running_micro += 1
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         scheduler.step()
         
-        running_loss_fm += loss_fm.item()
-        running_loss_dur += loss_dur.item()
-        
-        if (step + 1) % 500 == 0:
-            avg_fm = running_loss_fm / 500
-            avg_dur = running_loss_dur / 500
+        if (step + 1) % args.log_interval == 0:
+            avg_fm = running_loss_fm / max(1, running_micro)
+            avg_dur = running_loss_dur / max(1, running_micro)
             elapsed = time.time() - t0
-            speed = 500 / elapsed
+            speed = args.log_interval / elapsed
             lr = scheduler.get_last_lr()[0]
             
             # 获取 gate 统计
@@ -650,19 +765,31 @@ def main():
             print(f"Step {step+1}/{args.steps} | FM: {avg_fm:.4f} | Dur: {avg_dur:.4f} | {gate_str} | LR: {lr:.2e} | {speed:.1f} steps/s", flush=True)
             running_loss_fm = 0.0
             running_loss_dur = 0.0
+            running_micro = 0
             t0 = time.time()
+        
+        if args.save_interval > 0 and (step + 1) % args.save_interval == 0:
+            torch.save({
+                "model": model.state_dict(),
+                "version": args.model_version,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "step": step + 1,
+                "args": vars(args),
+                "metrics_history": metrics_history,
+            }, output_dir / f"step_{step+1}.pt")
         
         # 每 eval_interval steps 评估一次
         if (step + 1) % args.eval_interval == 0:
             model.eval()
             with torch.no_grad():
                 eval_item = train_loader.dataset.items[0]
-                T = min(len(eval_item['frame_phoneme_ids']), 256)  # v6: 25fps 需要更长
+                T = min(len(eval_item['frame_phoneme_ids']), args.eval_frames)
                 eval_phone = torch.tensor([eval_item['frame_phoneme_ids'][:T]], dtype=torch.long, device=device)
                 eval_pitch = torch.tensor([eval_item['pitch'][:T]], dtype=torch.float, device=device)
                 eval_energy = torch.tensor([eval_item['energy'][:T]], dtype=torch.float, device=device)
+                eval_lengths = torch.tensor([T], dtype=torch.long, device=device)
                 
-                import json
                 with open(args.stats_path) as f:
                     stats = json.load(f)
                 
@@ -671,25 +798,31 @@ def main():
                 latent_std = stats.get('global_std', stats.get('std', 1.0))
                 latent_pred = model.sample(
                     eval_phone, eval_pitch, eval_energy,
-                    n_steps=6, cfg_scale=1.5,
+                    n_steps=args.sample_steps, cfg_scale=args.cfg_scale,
                     latent_mean=latent_mean, latent_std=latent_std,
+                    solver=args.sample_solver,
+                    frame_lengths=eval_lengths,
                 )
                 
                 orig_latent = torch.load(eval_item['latent_path'], weights_only=True)
-                orig = orig_latent.T if orig_latent.dim() == 2 else orig_latent
+                orig = train_loader.dataset._to_time_channel(orig_latent)
                 pred = latent_pred.squeeze(0).cpu()
                 min_len = min(orig.shape[0], pred.shape[0])
+                orig = orig[:min_len]
+                pred = pred[:min_len]
                 corr = F.cosine_similarity(
-                    orig[:min_len].flatten().unsqueeze(0),
-                    pred[:min_len].flatten().unsqueeze(0),
+                    orig.flatten().unsqueeze(0),
+                    pred.flatten().unsqueeze(0),
                 ).item()
+                latent_mse = F.mse_loss(pred, orig).item()
                 
                 metrics_history["steps"].append(step + 1)
                 metrics_history["fm_loss"].append(avg_fm if 'avg_fm' in dir() else 0)
                 metrics_history["correlation"].append(corr)
+                metrics_history["latent_mse"].append(latent_mse)
                 metrics_history["lr"].append(scheduler.get_last_lr()[0])
                 
-                print(f"  [Eval] Step {step+1}: corr={corr:.4f}", flush=True)
+                print(f"  [Eval] Step {step+1}: corr={corr:.4f} latent_mse={latent_mse:.6f}", flush=True)
             model.train()
     
     # 保存
@@ -699,7 +832,7 @@ def main():
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "step": args.steps,
-        "dit_layers": args.dit_layers,
+        "args": vars(args),
         "metrics_history": metrics_history,
     }, output_dir / "fm_dit_v1_v16ae_model.pt")
     print(f"  模型: {output_dir / 'fm_dit_v1_v16ae_model.pt'}", flush=True)
@@ -708,7 +841,6 @@ def main():
     print("\nTesting...", flush=True)
     model.eval()
     
-    import json
     with open(args.data_path) as f:
         items = json.load(f)
     
@@ -719,6 +851,7 @@ def main():
     frame_phoneme_ids = torch.tensor([item['frame_phoneme_ids']], dtype=torch.long, device=device)
     pitch = torch.tensor([item['pitch']], dtype=torch.float, device=device)
     energy = torch.tensor([item['energy']], dtype=torch.float, device=device)
+    frame_lengths = torch.tensor([len(item['frame_phoneme_ids'])], dtype=torch.long, device=device)
     orig_latent = torch.load(item['latent_path'], weights_only=True)
     
     # 优先使用 global_mean/global_std (标量)
@@ -728,11 +861,13 @@ def main():
     for cfg_scale in [1.0, 1.5, 2.0]:
         latent_pred = model.sample(
             frame_phoneme_ids, pitch, energy,
-            n_steps=6, cfg_scale=cfg_scale,
+            n_steps=args.sample_steps, cfg_scale=cfg_scale,
             latent_mean=test_latent_mean, latent_std=test_latent_std,
+            solver=args.sample_solver,
+            frame_lengths=frame_lengths,
         )
         
-        orig = orig_latent.T if orig_latent.dim() == 2 else orig_latent
+        orig = train_loader.dataset._to_time_channel(orig_latent)
         pred = latent_pred.squeeze(0).cpu()
         
         min_len = min(orig.shape[0], pred.shape[0])

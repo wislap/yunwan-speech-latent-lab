@@ -21,24 +21,14 @@ x → SA →
 层 5-7: 同 v5.7
 """
 
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Optional
 
-from .dit_head_v5_6 import (
-    timestep_embedding,
-    RotaryEmbedding,
-    apply_rotary_pos_emb,
-    SwiGLU,
-    LightweightConvModule,
-    SelfAttentionRoPE,
-    EncoderBlock,
-    DecoderBlock,
-    GatedSkipWithTime,
-    ConcatSkip,
-)
+from .attention import SelfAttentionRoPE
+from .blocks import DecoderBlock, EncoderBlock
+from .embeddings import timestep_embedding
+from .layers import ConcatSkip, LightweightConvModule, SwiGLU
 
 
 class DualFFNBottleneck(nn.Module):
@@ -85,13 +75,18 @@ class DualFFNBottleneck(nn.Module):
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
     
-    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        c: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         mod = self.adaLN_modulation(c)
         gamma1, beta1, alpha1, gamma2, beta2, alpha2 = mod.chunk(6, dim=-1)
         
         # Self-Attention (共享)
         h = self.norm1(x) * (1 + gamma1) + beta1
-        h = self.self_attn(h)
+        h = self.self_attn(h, key_padding_mask=key_padding_mask)
         x = x + alpha1 * h
         
         # 高频分支
@@ -205,42 +200,60 @@ class DiTHeadV5_10(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         cond: torch.Tensor,
-        context: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, S, _ = x.shape
+        valid = None if key_padding_mask is None else (~key_padding_mask).unsqueeze(-1).to(dtype=x.dtype)
         
         # 输入融合
         x = self.input_proj(x) + 0.1 * self.cond_input_proj(cond)
+        if valid is not None:
+            x = x * valid
         
         # Timestep embedding
         t_emb = self.t_emb(timestep_embedding(t, self.d_model))
         t_emb_seq = t_emb.unsqueeze(1).expand(-1, S, -1)
         
         # 全局池化
-        cond_pooled = cond.mean(dim=1, keepdim=True).expand(-1, S, -1)
+        if valid is None:
+            cond_mean = cond.mean(dim=1, keepdim=True)
+        else:
+            denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+            cond_mean = (cond * valid).sum(dim=1, keepdim=True) / denom
+        cond_pooled = cond_mean.expand(-1, S, -1)
         cond_pooled = self.cond_pool_proj(cond_pooled)
         
         # Per-Token AdaLN 条件
         c = cond + t_emb_seq + cond_pooled
-        c_global = t_emb + cond.mean(dim=1)
+        c_global = t_emb + cond_mean.squeeze(1)
         
         # 编码侧: 存储 skip
         skips = []
         for block in self.encoder_blocks:
-            x = block(x, c)
+            x = block(x, c, key_padding_mask=key_padding_mask)
+            if valid is not None:
+                x = x * valid
             skips.append(x)
         
         # 双 FFN Bottleneck
-        x = self.bottleneck(x, c)
+        x = self.bottleneck(x, c, key_padding_mask=key_padding_mask)
+        if valid is not None:
+            x = x * valid
         
         # 解码侧: 使用 skip (逆序)
         for i, block in enumerate(self.decoder_blocks):
             skip = skips[-(i+1)]
-            x = block(x, skip, c, c_global)
+            x = block(x, skip, c, c_global, key_padding_mask=key_padding_mask)
+            if valid is not None:
+                x = x * valid
         
         # Output
         x = self.final_concat_skip(x, skips[0])
+        if valid is not None:
+            x = x * valid
         x = self.final_norm(x)
         x = self.final_proj(x)
+        if valid is not None:
+            x = x * valid
         
         return x
