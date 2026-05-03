@@ -322,6 +322,39 @@ def safe_save(obj: dict, path: Path) -> None:
     tmp_path.rename(path)
 
 
+def apply_freeze_policy(model: WavVAE, args: DictConfig) -> None:
+    """Apply configured module freezes after any global requires_grad reset."""
+    freeze_encoder = bool(args.get("freeze_encoder", False))
+    if not freeze_encoder:
+        return
+    model = getattr(model, "_orig_mod", model)
+
+    for p in model.encoder.parameters():
+        p.requires_grad = False
+    for p in model.bottleneck.parameters():
+        p.requires_grad = False
+
+    if bool(args.get("use_phase_refiner", False)) and bool(args.get("freeze_decoder", True)):
+        for p in model.decoder.parameters():
+            p.requires_grad = False
+
+    if bool(args.get("use_hybrid_decoder", False)) and bool(args.get("freeze_decoder_blocks", True)):
+        for p in model.decoder.proj.parameters():
+            p.requires_grad = False
+        for p in model.decoder.block0.parameters():
+            p.requires_grad = False
+
+    if bool(args.get("use_dual_path_decoder", False)):
+        for p in model.decoder.proj.parameters():
+            p.requires_grad = False
+        for p in model.decoder.block0.parameters():
+            p.requires_grad = False
+        for p in model.decoder.time_blocks.parameters():
+            p.requires_grad = False
+        for p in model.decoder.tail.parameters():
+            p.requires_grad = False
+
+
 # ─── Evaluation ──────────────────────────────────────────────
 
 
@@ -447,6 +480,7 @@ def train(args: DictConfig) -> None:
         std_min=float(args.get("std_min", 0.1)),
         std_max=float(args.get("std_max", 1.5)),
         reg_warmup_steps=int(args.get("reg_warmup_steps", 1000)),
+        sample_latent=bool(args.get("sample_latent", True)),
         use_istft_decoder=bool(args.get("use_istft_decoder", False)),
         istft_n_fft=int(args.get("istft_n_fft", 2048)),
         istft_hop=int(args.get("istft_hop", 512)),
@@ -514,33 +548,14 @@ def train(args: DictConfig) -> None:
 
     if freeze_encoder:
         print("  Freezing encoder and bottleneck")
-        for p in model.encoder.parameters():
-            p.requires_grad = False
-        for p in model.bottleneck.parameters():
-            p.requires_grad = False
-        # Also freeze decoder if phase_refiner is being trained standalone
+        apply_freeze_policy(model, args)
+        # Also report the extra freezes that apply to this run.
         if bool(args.get("use_phase_refiner", False)) and bool(args.get("freeze_decoder", True)):
             print("  Freezing decoder (phase refiner only training)")
-            for p in model.decoder.parameters():
-                p.requires_grad = False
-        # Freeze decoder.proj + block0 for hybrid decoder (only train vocos_head)
         if bool(args.get("use_hybrid_decoder", False)) and bool(args.get("freeze_decoder_blocks", True)):
             print("  Freezing decoder.proj + block0 (vocos head only training)")
-            for p in model.decoder.proj.parameters():
-                p.requires_grad = False
-            for p in model.decoder.block0.parameters():
-                p.requires_grad = False
-        # Freeze time-domain path for dual-path decoder (only train vocos_head)
         if bool(args.get("use_dual_path_decoder", False)):
             print("  Freezing time-domain path (vocos head only training)")
-            for p in model.decoder.proj.parameters():
-                p.requires_grad = False
-            for p in model.decoder.block0.parameters():
-                p.requires_grad = False
-            for p in model.decoder.time_blocks.parameters():
-                p.requires_grad = False
-            for p in model.decoder.tail.parameters():
-                p.requires_grad = False
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Trainable parameters: {trainable:,}")
 
@@ -792,12 +807,7 @@ def train(args: DictConfig) -> None:
             model.train()
             for p in model.parameters():
                 p.requires_grad = True
-            # Re-freeze encoder/bottleneck if freeze_encoder was set
-            if freeze_encoder:
-                for p in model.encoder.parameters():
-                    p.requires_grad = False
-                for p in model.bottleneck.parameters():
-                    p.requires_grad = False
+            apply_freeze_policy(model, args)
         epoch_g_loss = 0.0
         epoch_d_loss = 0.0
         epoch_steps = 0

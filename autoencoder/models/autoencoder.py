@@ -699,6 +699,7 @@ class VAEBottleneck(nn.Module):
         std_min: float = 0.1,
         std_max: float = 1.5,
         warmup_steps: int = 1000,
+        sample_latent: bool = True,
     ):
         super().__init__()
         self.reg_weight = reg_weight
@@ -706,6 +707,7 @@ class VAEBottleneck(nn.Module):
         self.std_min = std_min
         self.std_max = std_max
         self.warmup_steps = warmup_steps
+        self.sample_latent = sample_latent
         self._step = 0
 
     def set_step(self, step: int) -> None:
@@ -723,7 +725,7 @@ class VAEBottleneck(nn.Module):
         """Split encoder output into mean/std, sample z."""
         mean, scale_param = encoder_output.chunk(2, dim=1)
         std = F.softplus(scale_param) + 1e-4
-        if training:
+        if training and self.sample_latent:
             z = mean + std * torch.randn_like(mean)
         else:
             z = mean
@@ -764,6 +766,7 @@ class WavVAE(nn.Module):
         std_min: float = 0.1,
         std_max: float = 1.5,
         reg_warmup_steps: int = 1000,
+        sample_latent: bool = True,
         use_istft_decoder: bool = False,
         istft_n_fft: int = 2048,
         istft_hop: int = 512,
@@ -858,6 +861,7 @@ class WavVAE(nn.Module):
             std_min=std_min,
             std_max=std_max,
             warmup_steps=reg_warmup_steps,
+            sample_latent=sample_latent,
         )
         self._strides = list(strides)
 

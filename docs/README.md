@@ -18,8 +18,16 @@ docs/
 ├── v14.3/                  # V14.3 sub-pixel decoder (失败实验)
 │   ├── changelog.md
 │   └── experiments.md
-└── v14.4/                  # V14.4 去掉 shortcut (DAC-style)
-    └── changelog.md
+├── v14.4/                  # V14.4 去掉 shortcut (DAC-style)
+│   └── changelog.md
+├── v16.1/                  # V16.1 high-fidelity 128x baseline
+│   ├── hf_time.md
+│   └── report.md
+├── v15/                    # V15 dual-path 实验状态
+└── v16.2/                  # V16.2 256x 边界实验与诊断图表
+    ├── 256x_time.md
+    ├── diagnostics.md
+    └── figures/
 ```
 
 ## 版本线
