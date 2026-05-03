@@ -1,9 +1,12 @@
-# Wav-VAE 项目文档
+# Wav-VAE / Autoencoder 项目文档
+
+本目录由原 `docs/` 重命名而来，专门保留 autoencoder / Wav-VAE
+路线的实验记录。新的表示学习与 DiT 工作放在 `../fm_dit/`。
 
 ## 目录结构
 
 ```
-docs/
+docs_ae/
 ├── README.md               # 本文件
 ├── project_layout.md       # 本地/远程目录说明 + 工作流
 ├── v14/                    # V14 初始版本

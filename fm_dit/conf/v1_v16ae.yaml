@@ -1,0 +1,26 @@
+data:
+  train_manifest: fm_dit/data/ljspeech_v16_3_256x_dim384/train.json
+  val_manifest: fm_dit/data/ljspeech_v16_3_256x_dim384/val.json
+  latent_stats_path: fm_dit/data/ljspeech_v16_3_256x_dim384/latent_stats.json
+  sample_rate: 22050
+  frame_rate: 86.1328125
+  latent_dim: 384
+  max_frames: 256
+  min_frames: 16
+
+model:
+  latent_dim: 384
+  model_dim: 512
+  cond_dim: 512
+  dit_layers: 8
+
+training:
+  batch_size: 64
+  learning_rate: 5.0e-4
+  min_learning_rate: 1.0e-5
+  steps: 30000
+  eval_interval: 1000
+
+output:
+  dir: outputs/fm_dit/v1_v16ae
+
