@@ -643,7 +643,7 @@ This route should be treated as an ablation:
 Can semantic geometry emerge without explicit factor filters?
 ```
 
-It should not replace the staged filter-bank plan until proven.
+It should not replace the two-constraint V17 plan until proven.
 
 ## Shallow Multi-Group Linear Filter Bank
 
@@ -677,7 +677,7 @@ Regularization should avoid degeneracy rather than enforce independence:
 - Residual/detail capacity limit.
 - Leakage probes.
 
-This is a good candidate for the first concrete V17 module.
+This can be kept as an optional diagnostic or adapter implementation detail, but it should not define the V17 core module boundary.
 
 ## Controlled Pair Data
 
@@ -835,7 +835,9 @@ Staged V17: medium to high
 
 The project should proceed in stages.
 
-## Recommended Staged Plan
+## Older Staged Factorization Plan
+
+Status: superseded as the V17 core plan. The useful parts may remain as diagnostics inside the external encoder-adapter constraint, but V17 should not be framed as a filter-bank/factorization architecture.
 
 ### Stage 0: Offline Linear Semantic Filter Probe
 
@@ -933,7 +935,7 @@ Success criteria:
 - Pure sampling latent std no longer collapses.
 - Decoded audio becomes semantically aligned.
 
-## Candidate Module For Stage 0/1
+## Optional Diagnostic: Shallow Filter Groups
 
 Use shallow filter groups:
 
@@ -960,7 +962,208 @@ Regularization:
 - Residual/detail bottleneck.
 - Factor dropout for diagnostics.
 
-Do not use deep adapters in the first version.
+Do not use this as the primary V17 module definition. The current V17 core is the two-constraint design below.
+
+## V17 Core Constraint Modules
+
+Correction: the controlled synthetic corpus is a data source, not a V17 model module. V17 should stay minimal and be defined by two external constraints on the AE latent:
+
+```text
+audio -> AE encoder -> z -> AE decoder -> audio
+                 |
+                 + external modality encoder-adapter constraint
+                 + flow / generative constraint
+```
+
+### Module 1: External Modality Encoder-Adapter Constraint
+
+This module anchors the AE latent to external, interpretable modalities.
+
+Purpose:
+
+- Force `z` to expose information that external conditions can read.
+- Prevent semantics from existing only inside a downstream DiT.
+- Keep the AE latent aligned with text/content, speaker, and prosody signals.
+
+Form:
+
+```text
+audio/text/prosody/speaker -> frozen_or_supervised external encoder -> h_m
+AE latent z -> adapter_m(z) -> h_hat_m
+loss_m(h_hat_m, h_m)
+```
+
+Possible modalities:
+
+```text
+text / phoneme / pinyin-tone content
+speaker / prompt voice identity
+prosody / duration / pitch / energy / style
+audio SSL features if needed
+```
+
+Adapter rule:
+
+- The adapter should be shallow enough that the latent, not the adapter, carries the useful structure.
+- Start with linear or low-depth MLP adapters.
+- Deep adapters are ablations, not the core mechanism.
+
+Losses:
+
+```text
+L_content = cosine/contrastive/probe loss against text or phoneme encoder features
+L_speaker = speaker embedding or prompt-voice identity loss
+L_prosody = pitch/energy/duration/style prediction or alignment loss
+```
+
+This is not strict factorization. It is external anchoring:
+
+```text
+z should be readable by simple adapters into external modality spaces
+```
+
+### Module 2: Flow / Generative Constraint
+
+This module makes the latent generation-friendly.
+
+Purpose:
+
+- Penalize latent geometries that reconstruct well but are hard to generate.
+- Directly test whether conditions can couple to the latent endpoint.
+- Make V17 optimize for downstream FM-DiT usability, not only AE reconstruction.
+
+Form:
+
+```text
+condition c -> flow model -> z
+```
+
+or, for a residual variant:
+
+```text
+condition c -> coarse z_c
+flow noise -> residual r
+z = z_c + r
+```
+
+Loss:
+
+```text
+L_flow = flow_matching_loss(z, c)
+```
+
+The key is that `L_flow` should constrain the latent produced by the encoder:
+
+```text
+L = L_recon
+  + lambda_ext * L_external_adapter
+  + lambda_flow * L_flow
+```
+
+This makes the AE latent pay a cost when it stores information in a form that cannot be predicted or transported from conditions.
+
+Interpretation:
+
+- External adapter constraint says: the latent must be semantically readable.
+- Flow constraint says: the latent must be generatively reachable.
+- The two together define V17.
+
+Synthetic CosyVoice3 data is useful because it gives clean external labels and scalable controlled conditions, but it remains the training data pipeline rather than a core model module.
+
+### Implementation Smoke
+
+Date: 2026-05-04
+
+Implemented files:
+
+```text
+autoencoder/v17_constraints.py
+autoencoder/train.py
+autoencoder/conf/experiment/v17_constraints_smoke.yaml
+```
+
+Current minimal implementation:
+
+- External adapter constraint:
+  - pinyin+tone symbolic external encoder via `pypinyin`;
+  - duration-aware frame-aligned pinyin bucket CE from latent frames;
+  - shallow temporal latent adapter instead of utterance-level mean pooling for content;
+  - speed readout from utterance-level latent pooling;
+  - speaker/style heads exist but are disabled in the single-speaker seed config.
+- Flow/generative constraint:
+  - small conditional latent flow-matching network;
+  - condition vector built from pinyin/speaker/style/speed metadata;
+  - target detach is enabled in smoke mode to train the flow readout without letting it reshape `z` prematurely.
+
+Smoke command after design fix:
+
+```bash
+cd /root/autodl-tmp/project
+/root/miniconda3/bin/python -m autoencoder.train \
+  experiment=v17_constraints_smoke \
+  runtime=remote \
+  experiment.train.epochs=1 \
+  experiment.train.log_interval=36 \
+  experiment.train.eval_batches=1 \
+  experiment.train.output_dir=outputs/models/v17_constraints_smoke_duration
+```
+
+Smoke result:
+
+```text
+V17 constraints: ext_weight=0.05, flow_weight=0.01, params=1,497,057
+Train samples: 72, Eval samples: 8
+
+step 36 | G=2.8907 | v17=0.3229 ext=6.2556 flow=1.0135
+step 72 | G=2.2063 | v17=0.3138 ext=6.0715 flow=1.0186
+
+Epoch 0/1 | avg_G=2.6606
+Eval: SNR=-0.21dB | STFT=2.8506 | KL=0.000000
+Training complete.
+```
+
+Interpretation:
+
+- The two V17 constraints are now wired into AE training and optimize jointly with reconstruction.
+- The content constraint is now a real symbolic external modality target, not a random text hash.
+- The smoke is only a functionality check on the seed corpus, not a quality result.
+
+### Design Audit After Smoke
+
+The first smoke implementation should not be treated as a faithful V17 experiment. It exposed several design risks, and the first two have now been corrected in code:
+
+1. The hashed text encoder was only a plumbing placeholder.
+   - Fixed: replaced with pinyin+tone tokenization and duration-aware frame-aligned CE.
+   - Current duration source: manifest `pinyin_durations` if present; otherwise punctuation/speed heuristic.
+   - Remaining limitation: heuristic duration should later be replaced by true frontend/teacher/forced-alignment durations.
+
+2. Speaker/style heads are trivial on the current seed corpus.
+   - `seed_zh_v0` has only one speaker and mostly one style.
+   - Cross-entropy heads can be solved by bias terms, so they do not prove that `z` carries speaker/style.
+   - Fixed for smoke: speaker/style losses are disabled by default.
+
+3. Utterance-level mean pooling is too weak for content alignment.
+   - `z.mean(dim=-1)` destroys temporal order.
+   - Fixed for content: content now uses a temporal adapter and frame-level pinyin targets.
+   - Remaining limitation: current duration-aware alignment is heuristic unless true token durations are provided.
+
+4. Flow gradients into `z` are delicate.
+   - If the flow target is not detached, the loss can reshape latent geometry in unintended ways, including amplitude shrinkage or shortcut solutions.
+   - The smoke config now defaults to `v17_flow_detach_target: true`; this trains the flow readout against current latents.
+   - A later true joint V17 run must deliberately re-enable latent-gradient flow only after reconstruction and external targets are stable.
+
+5. The flow condition currently uses metadata features directly.
+   - This tests conditional reachability of `z`, but not necessarily whether the external adapter and flow share the same learned modality representation.
+   - A stricter design should route both adapter and flow through the same external condition encoder outputs.
+
+Required next correction before a real run:
+
+```text
+add multi-speaker / multi-style data before enabling speaker/style losses
+replace heuristic pinyin durations with teacher/frontend/forced-alignment durations
+keep flow target detached for diagnostics, then run a deliberate joint-gradient ablation
+report adapter readout and flow metrics separately
+```
 
 ## What Should Not Be Merged Into V17 Core Yet
 
@@ -982,42 +1185,41 @@ The best fused V17 direction is:
 
 ```text
 controlled paired data
-+ shallow linear semantic filter bank
++ external modality encoder-adapter constraint
 + supervised contrastive MI proxy
 + continuous semantic heads
 + direction consistency / analogy loss
 + external encoder/label anchoring
 + soft overlap/coherence control
 + staged MI graph control
-+ later DiT factor-space test
++ flow / generative constraint
 ```
 
 This preserves the key requirements:
 
 - Semantics are not assumed orthogonal.
 - Semantics can combine linearly.
-- Factors are externally anchored rather than self-invented.
-- Latent dimensions remain inspectable through masks and linear filters.
+- Latent readouts are externally anchored rather than self-invented.
+- Adapter readouts should remain shallow enough to be inspectable.
 - Mutual information is controlled according to semantic relationships, not blindly minimized.
 - Linear semantic directions are explicitly encouraged, not assumed to emerge from clustering.
 - The final success criterion is downstream generative usability, especially the FM-DiT `t=0` endpoint.
 
 ## Immediate Next Step
 
-Build Stage 0:
+Build the two-constraint V17 smoke path:
 
-1. Generate or collect controlled paired audio:
-   - same text/different speaker
-   - same speaker/different text
-   - same text/speaker/different prosody
-2. Encode all audio with frozen V16.3 AE.
-3. Train a shallow filter bank on frozen latents.
-4. Report:
-   - factor similarity matrices
-   - linear probe scores
-   - leakage scores
-   - analogy/direction consistency scores
-   - mask overlap and active dimensions
-   - whether factors improve DiT coarse initialization.
+1. Generate or collect controlled paired audio from CosyVoice3.
+2. Encode all audio with the AE.
+3. Add external modality encoder-adapter losses on `z`.
+4. Add a small flow/generative loss on `z`.
+5. Compare against reconstruction-only AE and post-hoc DiT.
+6. Report:
+   - reconstruction quality
+   - adapter readout scores
+   - adapter leakage/shortcut checks
+   - flow teacher-forced `t=0` metrics
+   - sampling std/corr
+   - decoded ASR CER/WER
 
-This is the lowest-cost way to test whether the V17 semantic factor hypothesis is viable before modifying the AE training objective.
+This is the lowest-cost way to test whether the V17 latent becomes both externally readable and generatively reachable.

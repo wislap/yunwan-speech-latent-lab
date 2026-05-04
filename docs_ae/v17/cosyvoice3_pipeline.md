@@ -77,6 +77,11 @@ Smoke result:
 
 Date: 2026-05-04
 
+V17 role:
+
+- This is a seed data source for the V17 external modality encoder-adapter and flow constraints.
+- It is not itself a V17 model module.
+
 Purpose:
 
 - Create a tiny but structurally correct CosyVoice3-distilled corpus.
@@ -111,6 +116,8 @@ Artifacts:
 /root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/manifest.jsonl
 /root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/manifest_train.jsonl
 /root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/manifest_val.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/manifest_train_pinyin.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/manifest_val_pinyin.jsonl
 /root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/seed_zh_v0/summary.json
 ```
 
@@ -120,6 +127,8 @@ Local copied metadata:
 outputs/tts/cosyvoice3/seed_zh_v0/manifest.jsonl
 outputs/tts/cosyvoice3/seed_zh_v0/manifest_train.jsonl
 outputs/tts/cosyvoice3/seed_zh_v0/manifest_val.jsonl
+outputs/tts/cosyvoice3/seed_zh_v0/manifest_train_pinyin.jsonl
+outputs/tts/cosyvoice3/seed_zh_v0/manifest_val_pinyin.jsonl
 outputs/tts/cosyvoice3/seed_zh_v0/summary.json
 ```
 
@@ -142,4 +151,5 @@ Caveats:
 
 - The first V0 generator produced only `0.92` and `1.0` speed variants due to the deterministic selection pattern. The local generator has been patched so future runs rotate through `0.92`, `1.0`, and `1.08`.
 - CosyVoice3 warns that many synthesis texts are shorter than the prompt text. This is acceptable for this seed pass, but the next prompt set should use shorter prompt text or longer utterances.
-- `pypinyin` and `jieba` are not installed in the current CosyVoice3 env. V0 therefore contains text/domain/speaker/style/speed labels, while pinyin/word-boundary labels should be added in a separate preprocessing step.
+- `pypinyin` was installed in the project Python env and used to create pinyin/tone metadata.
+- Current `pinyin_durations` are punctuation/speed heuristic labels, not teacher-native durations. Replace them with frontend/teacher/forced-alignment durations when available.

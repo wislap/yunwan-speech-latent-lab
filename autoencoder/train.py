@@ -35,6 +35,7 @@ from autoencoder.models.discriminator import (
     generator_loss,
 )
 from autoencoder.models.discriminator_v14 import V14Discriminator
+from autoencoder.v17_constraints import V17ConstraintModule
 
 
 # ─── Dataset ─────────────────────────────────────────────────
@@ -58,12 +59,15 @@ class AudioDataset(Dataset):
         sr: int = 22050,
         total_stride: int = 441,
         augment: bool = False,
+        return_metadata: bool = False,
     ):
         self.segment_length = segment_length
         self.sr = sr
         self.total_stride = total_stride
         self.augment = augment
+        self.return_metadata = return_metadata
         self._resamplers: dict[int, torchaudio.transforms.Resample] = {}
+        self.items: list[dict] = []
 
         if segment_length > 0:
             assert segment_length % total_stride == 0, (
@@ -74,22 +78,37 @@ class AudioDataset(Dataset):
         # data_path can be a JSON file (list of dicts with audio_path)
         # or a directory of wav files
         data_path = Path(data_path)
-        if data_path.suffix == ".json":
-            with open(data_path) as f:
-                items = json.load(f)
+        self._path_roots = [Path.cwd()]
+        if data_path.exists():
+            self._path_roots.append(data_path.parent)
+            if "outputs" in data_path.parts:
+                out_idx = data_path.parts.index("outputs")
+                if out_idx > 0:
+                    self._path_roots.append(Path(*data_path.parts[:out_idx]))
+        if data_path.suffix in {".json", ".jsonl"}:
+            with open(data_path, encoding="utf-8") as f:
+                if data_path.suffix == ".jsonl":
+                    items = [json.loads(line) for line in f if line.strip()]
+                else:
+                    items = json.load(f)
             self.audio_paths = []
             for item in items:
                 if isinstance(item, dict):
                     for key in ("audio_path", "path", "wav_path", "file"):
                         if key in item:
                             self.audio_paths.append(str(item[key]))
+                            item_copy = dict(item)
+                            item_copy["audio_path"] = str(item[key])
+                            self.items.append(item_copy)
                             break
                 elif isinstance(item, str):
                     self.audio_paths.append(item)
+                    self.items.append({"audio_path": item})
         elif data_path.is_dir():
             self.audio_paths = sorted(
                 str(p) for p in data_path.glob("*.wav")
             )
+            self.items = [{"audio_path": p} for p in self.audio_paths]
         else:
             raise ValueError(f"data_path must be a .json file or directory: {data_path}")
 
@@ -125,12 +144,13 @@ class AudioDataset(Dataset):
         p = Path(path)
         if p.exists():
             return str(p)
-        cwd_p = Path.cwd() / p
-        if cwd_p.exists():
-            return str(cwd_p)
+        for root in self._path_roots:
+            candidate = root / p
+            if candidate.exists():
+                return str(candidate)
         return path
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
+    def __getitem__(self, idx: int) -> torch.Tensor | dict:
         path = self._resolve_path(self.audio_paths[idx])
         try:
             import soundfile as sf
@@ -140,7 +160,10 @@ class AudioDataset(Dataset):
                 audio = audio.mean(dim=-1)
         except Exception:
             fallback_len = self.segment_length if self.segment_length > 0 else self.total_stride * 100
-            return torch.zeros(fallback_len)
+            audio = torch.zeros(fallback_len)
+            if self.return_metadata:
+                return {"audio": audio, "metadata": dict(self.items[idx])}
+            return audio
 
         # Resample if needed
         if file_sr != self.sr:
@@ -177,6 +200,8 @@ class AudioDataset(Dataset):
             noise_power = sig_power / (10.0 ** (noise_snr_db / 10.0))
             audio = audio + torch.randn_like(audio) * noise_power.sqrt()
 
+        if self.return_metadata:
+            return {"audio": audio, "metadata": dict(self.items[idx])}
         return audio
 
 
@@ -238,6 +263,12 @@ def collate_audio(batch: list[torch.Tensor]) -> torch.Tensor:
     max_len = max(x.shape[0] for x in batch)
     padded = [F.pad(x, (0, max_len - x.shape[0])) if x.shape[0] < max_len else x for x in batch]
     return torch.stack(padded, dim=0).unsqueeze(1)
+
+
+def collate_audio_with_metadata(batch: list[dict]) -> dict:
+    """Collate audio plus per-item metadata."""
+    audio = collate_audio([b["audio"] for b in batch])
+    return {"audio": audio, "metadata": [b.get("metadata", {}) for b in batch]}
 
 
 class LatentDataset(Dataset):
@@ -393,7 +424,12 @@ def evaluate(
         if batch_idx >= max_batches:
             break
 
-        audio = batch if isinstance(batch, torch.Tensor) else batch[0]
+        if isinstance(batch, torch.Tensor):
+            audio = batch
+        elif isinstance(batch, dict) and "audio" in batch:
+            audio = batch["audio"]
+        else:
+            audio = batch[0]
         if audio.dim() == 2:
             audio = audio.unsqueeze(1)
         audio = audio.to(device)
@@ -559,6 +595,36 @@ def train(args: DictConfig) -> None:
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Trainable parameters: {trainable:,}")
 
+    # ── V17 external adapter / flow constraints ─────────────
+    v17_enable = bool(args.get("v17_constraints_enable", False))
+    v17_constraints = None
+    if v17_enable:
+        v17_constraints = V17ConstraintModule(
+            latent_dim=int(args.latent_dim),
+            ext_weight=float(args.get("v17_ext_weight", 0.0)),
+            flow_weight=float(args.get("v17_flow_weight", 0.0)),
+            adapter_hidden_dim=int(args.get("v17_adapter_hidden_dim", 256)),
+            text_buckets=int(args.get("v17_text_buckets", 512)),
+            speaker_buckets=int(args.get("v17_speaker_buckets", 64)),
+            style_buckets=int(args.get("v17_style_buckets", 32)),
+            text_weight=float(args.get("v17_ext_text_weight", 1.0)),
+            speaker_weight=float(args.get("v17_ext_speaker_weight", 0.0)),
+            style_weight=float(args.get("v17_ext_style_weight", 0.0)),
+            speed_weight=float(args.get("v17_ext_speed_weight", 0.1)),
+            flow_hidden_dim=int(args.get("v17_flow_hidden_dim", 512)),
+            flow_depth=int(args.get("v17_flow_depth", 4)),
+            external_detach_latent=bool(args.get("v17_external_detach_latent", False)),
+            flow_detach_target=bool(args.get("v17_flow_detach_target", True)),
+            flow_min_t=float(args.get("v17_flow_min_t", 0.0)),
+            flow_max_t=float(args.get("v17_flow_max_t", 1.0)),
+        ).to(device)
+        print(
+            "  V17 constraints: "
+            f"ext_weight={float(args.get('v17_ext_weight', 0.0))}, "
+            f"flow_weight={float(args.get('v17_flow_weight', 0.0))}, "
+            f"params={count_parameters(v17_constraints):,}"
+        )
+
     # ── torch.compile ────────────────────────────────────────
     use_compile = bool(args.get("use_compile", False))
     if use_compile and hasattr(torch, "compile"):
@@ -652,7 +718,14 @@ def train(args: DictConfig) -> None:
         )
     else:
         augment = bool(args.get("augment", False))
-        train_dataset = AudioDataset(args.data_path, segment_length, sr, total_stride, augment=augment)
+        train_dataset = AudioDataset(
+            args.data_path,
+            segment_length,
+            sr,
+            total_stride,
+            augment=augment,
+            return_metadata=v17_enable,
+        )
 
         if segment_length == 0 and train_dataset._lengths is not None:
             # Full-length mode: dynamic batch size based on total samples budget
@@ -680,7 +753,7 @@ def train(args: DictConfig) -> None:
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
-                collate_fn=collate_audio,
+                collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
             )
         else:
             train_loader = DataLoader(
@@ -691,11 +764,12 @@ def train(args: DictConfig) -> None:
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
                 drop_last=True,
-                collate_fn=collate_audio,
+                collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
             )
 
     eval_dataset = AudioDataset(
         args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
+        return_metadata=v17_enable,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -704,13 +778,16 @@ def train(args: DictConfig) -> None:
         num_workers=min(num_workers, 2),
         prefetch_factor=prefetch_factor if min(num_workers, 2) > 0 else None,
         pin_memory=True,
-        collate_fn=collate_audio,
+        collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
     )
 
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
 
     # ── Optimizers ───────────────────────────────────────────
-    g_optimizer = torch.optim.AdamW(model.parameters(), lr=float(args.lr), betas=(0.8, 0.99))
+    g_params = list(model.parameters())
+    if v17_constraints is not None:
+        g_params += list(v17_constraints.parameters())
+    g_optimizer = torch.optim.AdamW(g_params, lr=float(args.lr), betas=(0.8, 0.99))
     d_optimizer = None
     if disc is not None:
         d_params = list(disc.parameters())
@@ -749,6 +826,8 @@ def train(args: DictConfig) -> None:
             disc.load_state_dict(ckpt["disc"])
         if subband_disc is not None and "subband_disc" in ckpt:
             subband_disc.load_state_dict(ckpt["subband_disc"])
+        if v17_constraints is not None and "v17_constraints" in ckpt:
+            v17_constraints.load_state_dict(ckpt["v17_constraints"])
         if d_optimizer is not None and "d_optimizer" in ckpt:
             d_optimizer.load_state_dict(ckpt["d_optimizer"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -791,6 +870,8 @@ def train(args: DictConfig) -> None:
     # ── Training loop ────────────────────────────────────────
     for epoch in range(start_epoch, epochs):
         model.train()
+        if v17_constraints is not None:
+            v17_constraints.train()
         if disc is not None:
             disc.train()
         if subband_disc is not None:
@@ -801,10 +882,14 @@ def train(args: DictConfig) -> None:
         disc_warming = use_adv and disc_warmup_epochs > 0 and epoch < (adv_start_epoch + disc_warmup_epochs)
         if disc_warming:
             model.eval()
+            if v17_constraints is not None:
+                v17_constraints.eval()
             for p in model.parameters():
                 p.requires_grad = False
         else:
             model.train()
+            if v17_constraints is not None:
+                v17_constraints.train()
             for p in model.parameters():
                 p.requires_grad = True
             apply_freeze_policy(model, args)
@@ -822,12 +907,21 @@ def train(args: DictConfig) -> None:
             if use_latent_dataset and isinstance(batch_data, dict):
                 audio = batch_data["audio"].to(device, non_blocking=True)
                 latent = batch_data["latent"].to(device, non_blocking=True)
+                metadata = batch_data.get("metadata", None)
+            elif isinstance(batch_data, dict) and "audio" in batch_data:
+                audio = batch_data["audio"]
+                if audio.dim() == 2:
+                    audio = audio.unsqueeze(1)
+                audio = audio.to(device, non_blocking=True)
+                latent = None
+                metadata = batch_data.get("metadata", None)
             else:
                 audio = batch_data
                 if audio.dim() == 2:
                     audio = audio.unsqueeze(1)
                 audio = audio.to(device, non_blocking=True)
                 latent = None
+                metadata = None
 
             # ── Generator step ───────────────────────────────
             model.set_step(global_step)
@@ -850,6 +944,10 @@ def train(args: DictConfig) -> None:
                     multiband_stft_weight=mb_stft_weight,
                 )
                 g_loss = recon_losses["total"]
+                v17_logs = {}
+                if v17_constraints is not None and metadata is not None and latent is None:
+                    v17_loss, v17_logs = v17_constraints(out["z"], metadata)
+                    g_loss = g_loss + v17_loss
 
                 # Adversarial losses (Phase 2)
                 adv_g_loss_val = 0.0
@@ -898,7 +996,7 @@ def train(args: DictConfig) -> None:
                 (g_loss / grad_accum_steps).backward()
 
                 if (batch_idx + 1) % grad_accum_steps == 0:
-                    g_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                    g_norm = torch.nn.utils.clip_grad_norm_(g_params, grad_clip)
                     if torch.isfinite(g_norm):
                         g_optimizer.step()
                     else:
@@ -955,6 +1053,14 @@ def train(args: DictConfig) -> None:
                 )
                 if "mb_stft" in recon_losses:
                     msg += f" mb_stft={recon_losses['mb_stft'].item():.4f}"
+                if v17_logs:
+                    msg += (
+                        f" | v17={v17_logs['v17_total'].item():.4f}"
+                    )
+                    if "v17_ext_total" in v17_logs:
+                        msg += f" ext={v17_logs['v17_ext_total'].item():.4f}"
+                    if "v17_flow" in v17_logs:
+                        msg += f" flow={v17_logs['v17_flow'].item():.4f}"
                 if use_adv:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
                     if sb_adv_g_val > 0:
@@ -1003,6 +1109,8 @@ def train(args: DictConfig) -> None:
                     "best_snr": best_snr,
                     "metrics": metrics,
                 }
+                if v17_constraints is not None:
+                    save_dict["v17_constraints"] = v17_constraints.state_dict()
                 safe_save(save_dict, output_dir / "best.pt")
                 print(f"  New best SNR: {best_snr:.2f}dB")
 
@@ -1021,6 +1129,8 @@ def train(args: DictConfig) -> None:
             save_dict["disc"] = disc.state_dict()
         if subband_disc is not None:
             save_dict["subband_disc"] = subband_disc.state_dict()
+        if v17_constraints is not None:
+            save_dict["v17_constraints"] = v17_constraints.state_dict()
         if d_optimizer is not None:
             save_dict["d_optimizer"] = d_optimizer.state_dict()
         if d_scheduler is not None:
