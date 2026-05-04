@@ -77,6 +77,14 @@ def load_dit(checkpoint: Path, device: torch.device) -> tuple[FMDiTV16AE, dict]:
         cond_drop_prob=float(args.get("cond_drop_prob", 0.1)),
         use_duration_predictor=not bool(args.get("no_duration_predictor", False)),
         use_condition_encoder=not bool(args.get("no_condition_encoder", False)),
+        use_coarse_predictor=bool(args.get("coarse_latent", False)),
+        coarse_hidden_dim=int(args.get("coarse_hidden_dim", 1024)),
+        coarse_layers=int(args.get("coarse_layers", 4)),
+        coarse_heads=int(args.get("coarse_heads", 8)),
+        coarse_dim_ff=int(args.get("coarse_dim_ff", 4096)),
+        residual_flow=bool(args.get("residual_flow", False)),
+        uncond_residual_flow=bool(args.get("uncond_residual_flow", False)),
+        detach_coarse_for_flow=not bool(args.get("no_detach_coarse_for_flow", False)),
     )
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval(), args

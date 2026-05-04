@@ -40,6 +40,14 @@ def load_model(checkpoint: Path, device: torch.device) -> tuple[FMDiTV16AE, dict
         cond_drop_prob=float(args.get("cond_drop_prob", 0.1)),
         use_duration_predictor=not bool(args.get("no_duration_predictor", False)),
         use_condition_encoder=not bool(args.get("no_condition_encoder", False)),
+        use_coarse_predictor=bool(args.get("coarse_latent", False)),
+        coarse_hidden_dim=int(args.get("coarse_hidden_dim", 1024)),
+        coarse_layers=int(args.get("coarse_layers", 4)),
+        coarse_heads=int(args.get("coarse_heads", 8)),
+        coarse_dim_ff=int(args.get("coarse_dim_ff", 4096)),
+        residual_flow=bool(args.get("residual_flow", False)),
+        uncond_residual_flow=bool(args.get("uncond_residual_flow", False)),
+        detach_coarse_for_flow=not bool(args.get("no_detach_coarse_for_flow", False)),
     )
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval(), args
@@ -112,14 +120,21 @@ def main() -> None:
             energy = torch.tensor([item["energy"][:S]], dtype=torch.float32, device=device)
             cond = model.encode_cond(frame_phoneme_ids, pitch, energy, drop_cond=False)
             cond = cond * valid.to(dtype=cond.dtype)
+            coarse = None
+            flow_target = z
+            if model.use_coarse_predictor:
+                coarse = model.predict_coarse_latent(frame_phoneme_ids, pitch, energy, frame_lengths=lengths)
+                flow_target = z - coarse if model.residual_flow else z
+            if model.use_coarse_predictor and model.uncond_residual_flow:
+                cond = torch.zeros_like(cond)
 
             for t_val in t_values:
                 metrics = []
                 for repeat in range(args.repeats):
-                    noise = model.sample_base_noise_like(z, valid_mask=valid)
+                    noise = model.sample_base_noise_like(flow_target, valid_mask=valid)
                     t = torch.full((1, 1, 1), t_val, device=device, dtype=z.dtype)
-                    x_t = (1.0 - t) * noise + t * z
-                    v_target = z - noise
+                    x_t = (1.0 - t) * noise + t * flow_target
+                    v_target = flow_target - noise
                     v_pred = model.latent_out_proj(
                         model.dit(
                             model.latent_in_proj(x_t),
@@ -129,6 +144,8 @@ def main() -> None:
                         )
                     )
                     z_hat = x_t + (1.0 - t) * v_pred
+                    if coarse is not None and model.residual_flow:
+                        z_hat = z_hat + coarse
 
                     target_flat = masked_flat(z, valid)
                     pred_flat = masked_flat(z_hat, valid)

@@ -238,6 +238,43 @@ class CNNDurationPredictor(nn.Module):
         return duration
 
 
+class CoarseLatentPredictor(nn.Module):
+    """Predict a condition-coupled coarse latent in normalized AE latent space."""
+
+    def __init__(
+        self,
+        cond_dim: int,
+        latent_dim: int,
+        hidden_dim: int = 1024,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        dim_feedforward: int = 4096,
+        drop_path: float = 0.05,
+    ):
+        super().__init__()
+        self.in_proj = nn.Linear(cond_dim, hidden_dim)
+        self.pos_enc = SinusoidalPE(hidden_dim)
+        self.transformer = PreLNTransformerEncoder(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=dim_feedforward,
+            num_layers=n_layers,
+            drop_path=drop_path,
+        )
+        self.out = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, latent_dim),
+        )
+
+    def forward(self, cond: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.in_proj(cond)
+        x = self.pos_enc(x)
+        x = self.transformer(x, src_key_padding_mask=key_padding_mask)
+        return self.out(x)
+
+
 class FMDiTV16AE(nn.Module):
     """Frame-conditioned DiT wrapper for V16 AE latent flow.
 
@@ -260,6 +297,14 @@ class FMDiTV16AE(nn.Module):
         cond_drop_prob: float = 0.1,
         use_duration_predictor: bool = True,
         use_condition_encoder: bool = True,
+        use_coarse_predictor: bool = False,
+        coarse_hidden_dim: int = 1024,
+        coarse_layers: int = 4,
+        coarse_heads: int = 8,
+        coarse_dim_ff: int = 4096,
+        residual_flow: bool = False,
+        uncond_residual_flow: bool = False,
+        detach_coarse_for_flow: bool = True,
     ):
         super().__init__()
         if model_dim is None:
@@ -314,6 +359,20 @@ class FMDiTV16AE(nn.Module):
             nn.Linear(cond_dim, cond_dim),
         )
         self.cond_norm = nn.LayerNorm(cond_dim)
+
+        self.use_coarse_predictor = use_coarse_predictor
+        self.residual_flow = residual_flow
+        self.uncond_residual_flow = uncond_residual_flow
+        self.detach_coarse_for_flow = detach_coarse_for_flow
+        if use_coarse_predictor:
+            self.coarse_predictor = CoarseLatentPredictor(
+                cond_dim=cond_dim,
+                latent_dim=latent_dim,
+                hidden_dim=coarse_hidden_dim,
+                n_layers=coarse_layers,
+                n_heads=coarse_heads,
+                dim_feedforward=coarse_dim_ff,
+            )
         
         # Latent <-> DiT 内部维度投影
         self.latent_in_proj = nn.Identity() if latent_dim == model_dim else nn.Linear(latent_dim, model_dim)
@@ -412,6 +471,30 @@ class FMDiTV16AE(nn.Module):
         cond = self.cond_proj(cond)
         cond = self.cond_norm(cond)
         return cond
+
+    def predict_coarse_latent(
+        self,
+        frame_phoneme_ids: torch.Tensor,
+        pitch: torch.Tensor,
+        energy: torch.Tensor,
+        frame_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if not self.use_coarse_predictor:
+            raise RuntimeError("coarse latent predictor is not enabled")
+        B, S = frame_phoneme_ids.shape
+        key_padding_mask = None
+        valid_mask = None
+        if frame_lengths is not None:
+            frame_lengths = frame_lengths.to(device=frame_phoneme_ids.device).clamp(min=1, max=S)
+            valid_mask = lengths_to_valid_mask(frame_lengths, S).unsqueeze(-1)
+            key_padding_mask = ~valid_mask.squeeze(-1)
+        cond = self.encode_cond(frame_phoneme_ids, pitch, energy, drop_cond=False)
+        if valid_mask is not None:
+            cond = cond * valid_mask.to(dtype=cond.dtype)
+        coarse = self.coarse_predictor(cond, key_padding_mask=key_padding_mask)
+        if valid_mask is not None:
+            coarse = coarse * valid_mask.to(dtype=coarse.dtype)
+        return coarse
     
     def forward(
         self,
@@ -442,21 +525,30 @@ class FMDiTV16AE(nn.Module):
             key_padding_mask = ~valid_mask.squeeze(-1)
             latent_target = latent_target * valid_mask.to(dtype=latent_target.dtype)
         
+        coarse = None
+        flow_target = latent_target
+        if self.use_coarse_predictor:
+            coarse = self.predict_coarse_latent(frame_phoneme_ids, pitch, energy, frame_lengths=frame_lengths)
+            flow_base = coarse.detach() if self.detach_coarse_for_flow else coarse
+            flow_target = latent_target - flow_base if self.residual_flow else latent_target
+
         # CFG: 随机 drop 条件
         drop_cond = random.random() < self.cond_drop_prob
         cond = self.encode_cond(frame_phoneme_ids, pitch, energy, drop_cond=drop_cond)
+        if self.use_coarse_predictor and self.uncond_residual_flow:
+            cond = torch.zeros_like(cond)
         if valid_mask is not None:
             cond = cond * valid_mask.to(dtype=cond.dtype)
         
-        # Flow matching: noise -> latent.
+        # Flow matching: noise -> latent or residual, depending on the active experiment.
         t = sample_flow_t(
             B, t_sampling, beta_alpha, beta_beta,
             logit_loc, logit_scale, t_eps, t_min, device,
         )
-        noise = self.sample_base_noise_like(latent_target, valid_mask=valid_mask)
+        noise = self.sample_base_noise_like(flow_target, valid_mask=valid_mask)
         
-        x_t = (1 - t) * noise + t * latent_target
-        v_target = latent_target - noise
+        x_t = (1 - t) * noise + t * flow_target
+        v_target = flow_target - noise
         
         # DiT uses model_dim internally, while the flow state and loss stay in
         # the normalized AE latent space. This trains both I/O projections when
@@ -484,6 +576,17 @@ class FMDiTV16AE(nn.Module):
         else:
             mse_per_sample = sq_err.mean(dim=(1, 2))
         loss_fm = (weight.squeeze() * mse_per_sample).mean()
+
+        loss_coarse = torch.tensor(0.0, device=device)
+        if coarse is not None:
+            coarse_err = (coarse - latent_target) ** 2
+            if valid_mask is not None:
+                coarse_err = coarse_err * valid_mask.to(dtype=coarse_err.dtype)
+                loss_coarse = coarse_err.sum() / (
+                    valid_mask.sum().to(dtype=coarse_err.dtype).clamp_min(1.0) * coarse_err.shape[-1]
+                )
+            else:
+                loss_coarse = coarse_err.mean()
         
         # Duration Predictor 辅助任务
         loss_dur = torch.tensor(0.0, device=device)
@@ -496,7 +599,7 @@ class FMDiTV16AE(nn.Module):
             gt_dur = gt_duration[:, :min_len]
             loss_dur = F.mse_loss(torch.log1p(pred_dur), torch.log1p(gt_dur))
         
-        return loss_fm, loss_dur
+        return loss_fm, loss_dur, loss_coarse
     
     @torch.no_grad()
     def sample(
@@ -519,6 +622,9 @@ class FMDiTV16AE(nn.Module):
             raise ValueError(f"t_start must be in [0, 1), got {t_start}")
         
         cond = self.encode_cond(frame_phoneme_ids, pitch, energy)
+        coarse = None
+        if self.use_coarse_predictor:
+            coarse = self.predict_coarse_latent(frame_phoneme_ids, pitch, energy, frame_lengths=frame_lengths)
         uncond = torch.zeros_like(cond)
         key_padding_mask = None
         valid_mask = None
@@ -527,6 +633,10 @@ class FMDiTV16AE(nn.Module):
             valid_mask = lengths_to_valid_mask(frame_lengths, S).unsqueeze(-1)
             key_padding_mask = ~valid_mask.squeeze(-1)
             cond = cond * valid_mask.to(dtype=cond.dtype)
+            if coarse is not None:
+                coarse = coarse * valid_mask.to(dtype=coarse.dtype)
+        if self.use_coarse_predictor and self.uncond_residual_flow:
+            cond = torch.zeros_like(cond)
         
         x = self.sample_base_noise_like(
             torch.empty(B, S, self.latent_dim, device=device),
@@ -584,6 +694,10 @@ class FMDiTV16AE(nn.Module):
         
         if valid_mask is not None:
             x = x * valid_mask.to(dtype=x.dtype)
+        if coarse is not None and self.residual_flow:
+            x = x + coarse
+            if valid_mask is not None:
+                x = x * valid_mask.to(dtype=x.dtype)
         # 处理 latent_std/latent_mean 可能是列表的情况 (per-dim stats)
         if isinstance(latent_std, (list, tuple)):
             latent_std = torch.tensor(latent_std, device=x.device, dtype=x.dtype).view(1, 1, -1)
@@ -627,6 +741,15 @@ def main():
     parser.add_argument("--dur-weight", type=float, default=0.1)
     parser.add_argument("--no-duration-predictor", action="store_true")
     parser.add_argument("--no-condition-encoder", action="store_true", help="use zero conditioning and skip the text/prosody encoder path")
+    parser.add_argument("--coarse-latent", action="store_true", help="enable condition -> coarse latent prediction")
+    parser.add_argument("--coarse-weight", type=float, default=1.0, help="weight for coarse latent MSE loss")
+    parser.add_argument("--coarse-hidden-dim", type=int, default=1024)
+    parser.add_argument("--coarse-layers", type=int, default=4)
+    parser.add_argument("--coarse-heads", type=int, default=8)
+    parser.add_argument("--coarse-dim-ff", type=int, default=4096)
+    parser.add_argument("--residual-flow", action="store_true", help="train flow on z_target - z_coarse instead of full z_target")
+    parser.add_argument("--uncond-residual-flow", action="store_true", help="use zero DiT conditioning for the residual flow path")
+    parser.add_argument("--no-detach-coarse-for-flow", action="store_true", help="allow flow loss gradients into coarse predictor")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-frames", type=int, default=256, help="training crop length in latent frames")
     parser.add_argument("--full-samples", action="store_true", help="disable random crops and train on complete latent sequences")
@@ -680,12 +803,23 @@ def main():
         cond_drop_prob=args.cond_drop_prob,
         use_duration_predictor=not args.no_duration_predictor,
         use_condition_encoder=not args.no_condition_encoder,
+        use_coarse_predictor=args.coarse_latent,
+        coarse_hidden_dim=args.coarse_hidden_dim,
+        coarse_layers=args.coarse_layers,
+        coarse_heads=args.coarse_heads,
+        coarse_dim_ff=args.coarse_dim_ff,
+        residual_flow=args.residual_flow,
+        uncond_residual_flow=args.uncond_residual_flow,
+        detach_coarse_for_flow=not args.no_detach_coarse_for_flow,
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters())
     dit_params = sum(p.numel() for p in model.dit.parameters())
     print(f"Model: {n_params/1e6:.2f}M params", flush=True)
     print(f"  DiT Head: {dit_params/1e6:.2f}M", flush=True)
+    if model.use_coarse_predictor:
+        coarse_params = sum(p.numel() for p in model.coarse_predictor.parameters())
+        print(f"  Coarse Predictor: {coarse_params/1e6:.2f}M", flush=True)
 
     if args.noise_init == "pca":
         if not args.pca_path:
@@ -810,6 +944,7 @@ def main():
         "steps": [],
         "fm_loss": [],
         "dur_loss": [],
+        "coarse_loss": [],
         "correlation": [],
         "latent_mse": [],
         "lr": [],
@@ -841,6 +976,11 @@ def main():
     print(f"  latent_dim={args.latent_dim} (I/O), model_dim={model.model_dim} (DiT internal)", flush=True)
     print(f"  max_frames={args.max_frames}, min_frames={args.min_frames}, full_samples={args.full_samples}", flush=True)
     print(f"  condition_encoder={model.use_condition_encoder}, duration_predictor={model.use_duration_predictor}", flush=True)
+    print(
+        f"  coarse_latent={model.use_coarse_predictor}, residual_flow={model.residual_flow}, "
+        f"uncond_residual_flow={model.uncond_residual_flow}, coarse_weight={args.coarse_weight}",
+        flush=True,
+    )
     print(f"  t_sampling={args.t_sampling}, t_min={args.t_min}, min_snr_gamma={args.min_snr_gamma}", flush=True)
     if args.t_min_start is not None or args.t_min_end is not None:
         print(
@@ -859,6 +999,7 @@ def main():
     t0 = time.time()
     running_loss_fm = 0.0
     running_loss_dur = 0.0
+    running_loss_coarse = 0.0
     running_micro = 0
     amp_enabled = device == "cuda" and not args.no_amp
     amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
@@ -889,7 +1030,7 @@ def main():
             )
             
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
-                loss_fm, loss_dur = model(
+                loss_fm, loss_dur, loss_coarse = model(
                     latent, frame_phoneme_ids, pitch, energy,
                     phoneme_ids, gt_duration,
                     frame_lengths=frame_lengths,
@@ -902,11 +1043,12 @@ def main():
                     t_min=current_t_min,
                     min_snr_gamma=args.min_snr_gamma,
                 )
-                loss = (loss_fm + args.dur_weight * loss_dur) / args.grad_accum_steps
+                loss = (loss_fm + args.dur_weight * loss_dur + args.coarse_weight * loss_coarse) / args.grad_accum_steps
             
             loss.backward()
             running_loss_fm += loss_fm.item()
             running_loss_dur += loss_dur.item()
+            running_loss_coarse += loss_coarse.item()
             running_micro += 1
         
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -916,6 +1058,7 @@ def main():
         if (step + 1) % args.log_interval == 0:
             avg_fm = running_loss_fm / max(1, running_micro)
             avg_dur = running_loss_dur / max(1, running_micro)
+            avg_coarse = running_loss_coarse / max(1, running_micro)
             elapsed = time.time() - t0
             speed = args.log_interval / elapsed
             lr = scheduler.get_last_lr()[0]
@@ -932,9 +1075,15 @@ def main():
                 args.t_min_warmup_steps,
                 args.t_min_schedule,
             )
-            print(f"Step {step+1}/{args.steps} | FM: {avg_fm:.4f} | Dur: {avg_dur:.4f} | t_min={log_t_min:.3f} | {gate_str} | LR: {lr:.2e} | {speed:.1f} steps/s", flush=True)
+            print(
+                f"Step {step+1}/{args.steps} | FM: {avg_fm:.4f} | Dur: {avg_dur:.4f} "
+                f"| Coarse: {avg_coarse:.4f} | t_min={log_t_min:.3f} | {gate_str} "
+                f"| LR: {lr:.2e} | {speed:.1f} steps/s",
+                flush=True,
+            )
             running_loss_fm = 0.0
             running_loss_dur = 0.0
+            running_loss_coarse = 0.0
             running_micro = 0
             t0 = time.time()
         
@@ -988,6 +1137,7 @@ def main():
                 
                 metrics_history["steps"].append(step + 1)
                 metrics_history["fm_loss"].append(avg_fm if 'avg_fm' in dir() else 0)
+                metrics_history["coarse_loss"].append(avg_coarse if 'avg_coarse' in dir() else 0)
                 metrics_history["correlation"].append(corr)
                 metrics_history["latent_mse"].append(latent_mse)
                 metrics_history["lr"].append(scheduler.get_last_lr()[0])
