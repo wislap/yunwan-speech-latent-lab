@@ -13,6 +13,7 @@ import random
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -91,6 +92,43 @@ def sample_flow_t(
     if t_min > 0.0:
         t = t_min + (1.0 - t_min) * t
     return t.clamp(eps, 1.0 - eps)
+
+
+def scheduled_t_min(
+    step: int,
+    default_t_min: float,
+    t_min_start: float | None,
+    t_min_end: float | None,
+    warmup_steps: int,
+    schedule: str,
+) -> float:
+    """Return the curriculum lower bound for flow time."""
+    if t_min_start is None and t_min_end is None:
+        return default_t_min
+    start = default_t_min if t_min_start is None else t_min_start
+    end = default_t_min if t_min_end is None else t_min_end
+    if warmup_steps <= 0:
+        return end
+    progress = min(max(step / warmup_steps, 0.0), 1.0)
+    if schedule == "cosine":
+        progress = 0.5 - 0.5 * math.cos(math.pi * progress)
+    elif schedule != "linear":
+        raise ValueError(f"unknown t_min schedule: {schedule}")
+    return start + (end - start) * progress
+
+
+def stats_vectors(stats_path: str, latent_dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    with open(stats_path) as f:
+        stats = json.load(f)
+    if isinstance(stats.get("mean"), list) and isinstance(stats.get("std"), list):
+        mean = torch.tensor(stats["mean"], dtype=torch.float32)
+        std = torch.tensor(stats["std"], dtype=torch.float32)
+    else:
+        mean = torch.full((latent_dim,), float(stats.get("global_mean", stats.get("mean", 0.0))), dtype=torch.float32)
+        std = torch.full((latent_dim,), float(stats.get("global_std", stats.get("std", 1.0))), dtype=torch.float32)
+    if mean.numel() != latent_dim or std.numel() != latent_dim:
+        raise ValueError(f"latent stats dim mismatch: mean={mean.numel()} std={std.numel()} latent_dim={latent_dim}")
+    return mean, std
 
 
 class DropPath(nn.Module):
@@ -221,6 +259,7 @@ class FMDiTV16AE(nn.Module):
         dit_n_heads: int = 8,
         cond_drop_prob: float = 0.1,
         use_duration_predictor: bool = True,
+        use_condition_encoder: bool = True,
     ):
         super().__init__()
         if model_dim is None:
@@ -298,10 +337,56 @@ class FMDiTV16AE(nn.Module):
         self.model_dim = model_dim
         self.cond_dim = cond_dim
         self.cond_drop_prob = cond_drop_prob
+        self.use_condition_encoder = use_condition_encoder
+        self.noise_init = "gaussian"
+        self.register_buffer("pca_components_norm", torch.empty(0), persistent=False)
+        self.register_buffer("pca_score_std", torch.empty(0), persistent=False)
+        self.register_buffer("pca_mean_norm", torch.empty(0), persistent=False)
+        self.pca_variance_scale = 1.0
+
+    def configure_pca_noise(
+        self,
+        components: torch.Tensor,
+        score_std: torch.Tensor,
+        pca_mean: torch.Tensor,
+        latent_mean: torch.Tensor,
+        latent_std: torch.Tensor,
+        variance_scale: float = 1.0,
+        use_mean: bool = True,
+    ) -> None:
+        """Configure PCA-shaped base noise in the normalized latent space."""
+        if components.dim() != 2 or components.shape[1] != self.latent_dim:
+            raise ValueError(f"PCA components must be [K, {self.latent_dim}], got {tuple(components.shape)}")
+        latent_std = latent_std.clamp_min(1e-6)
+        self.noise_init = "pca"
+        self.pca_components_norm = components / latent_std.view(1, -1)
+        self.pca_score_std = score_std
+        if use_mean:
+            self.pca_mean_norm = (pca_mean - latent_mean) / latent_std
+        else:
+            self.pca_mean_norm = torch.zeros_like(latent_mean)
+        self.pca_variance_scale = variance_scale
+
+    def sample_base_noise_like(self, latent_target: torch.Tensor, valid_mask: torch.Tensor | None = None) -> torch.Tensor:
+        """Sample the flow start distribution in normalized AE latent space."""
+        if self.noise_init != "pca":
+            noise = torch.randn_like(latent_target)
+        else:
+            B, S, _ = latent_target.shape
+            K = self.pca_components_norm.shape[0]
+            score_scale = self.pca_score_std.to(device=latent_target.device, dtype=latent_target.dtype)
+            score_scale = score_scale.view(1, 1, K) * math.sqrt(self.pca_variance_scale)
+            scores = torch.randn(B, S, K, device=latent_target.device, dtype=latent_target.dtype) * score_scale
+            components = self.pca_components_norm.to(device=latent_target.device, dtype=latent_target.dtype)
+            mean = self.pca_mean_norm.to(device=latent_target.device, dtype=latent_target.dtype).view(1, 1, -1)
+            noise = torch.matmul(scores, components) + mean
+        if valid_mask is not None:
+            noise = noise * valid_mask.to(dtype=noise.dtype)
+        return noise
     
     def encode_cond(self, frame_phoneme_ids, pitch, energy, drop_cond=False):
         """编码条件"""
-        if drop_cond:
+        if drop_cond or not self.use_condition_encoder:
             B, S = frame_phoneme_ids.shape
             return torch.zeros(B, S, self.cond_dim, device=frame_phoneme_ids.device)
         
@@ -368,9 +453,7 @@ class FMDiTV16AE(nn.Module):
             B, t_sampling, beta_alpha, beta_beta,
             logit_loc, logit_scale, t_eps, t_min, device,
         )
-        noise = torch.randn_like(latent_target)
-        if valid_mask is not None:
-            noise = noise * valid_mask.to(dtype=noise.dtype)
+        noise = self.sample_base_noise_like(latent_target, valid_mask=valid_mask)
         
         x_t = (1 - t) * noise + t * latent_target
         v_target = latent_target - noise
@@ -427,10 +510,13 @@ class FMDiTV16AE(nn.Module):
         latent_std: float = 1.0,
         solver: str = "dpm2",
         frame_lengths: torch.Tensor | None = None,
+        t_start: float = 0.0,
     ) -> torch.Tensor:
         """推理采样"""
         B, S = frame_phoneme_ids.shape
         device = frame_phoneme_ids.device
+        if not 0.0 <= t_start < 1.0:
+            raise ValueError(f"t_start must be in [0, 1), got {t_start}")
         
         cond = self.encode_cond(frame_phoneme_ids, pitch, energy)
         uncond = torch.zeros_like(cond)
@@ -442,14 +528,15 @@ class FMDiTV16AE(nn.Module):
             key_padding_mask = ~valid_mask.squeeze(-1)
             cond = cond * valid_mask.to(dtype=cond.dtype)
         
-        x = torch.randn(B, S, self.latent_dim, device=device)
-        if valid_mask is not None:
-            x = x * valid_mask.to(dtype=x.dtype)
-        dt = 1.0 / n_steps
+        x = self.sample_base_noise_like(
+            torch.empty(B, S, self.latent_dim, device=device),
+            valid_mask=valid_mask,
+        )
+        dt = (1.0 - t_start) / n_steps
         
         if solver == "euler":
             for i in range(n_steps):
-                t = torch.full((B,), i * dt, device=device)
+                t = torch.full((B,), t_start + i * dt, device=device)
                 x_model = self.latent_in_proj(x)
                 v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
                 v_uncond = self.latent_out_proj(self.dit(x_model, t, uncond, key_padding_mask=key_padding_mask))
@@ -460,8 +547,8 @@ class FMDiTV16AE(nn.Module):
                 
         elif solver == "heun":
             for i in range(n_steps):
-                t = torch.full((B,), i * dt, device=device)
-                t_next = torch.full((B,), (i + 1) * dt, device=device)
+                t = torch.full((B,), t_start + i * dt, device=device)
+                t_next = torch.full((B,), min(1.0, t_start + (i + 1) * dt), device=device)
                 
                 x_model = self.latent_in_proj(x)
                 v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
@@ -481,7 +568,7 @@ class FMDiTV16AE(nn.Module):
         else:  # dpm2
             prev_v = None
             for i in range(n_steps):
-                t = torch.full((B,), i * dt, device=device)
+                t = torch.full((B,), t_start + i * dt, device=device)
                 x_model = self.latent_in_proj(x)
                 v_cond = self.latent_out_proj(self.dit(x_model, t, cond, key_padding_mask=key_padding_mask))
                 v_uncond = self.latent_out_proj(self.dit(x_model, t, uncond, key_padding_mask=key_padding_mask))
@@ -539,8 +626,10 @@ def main():
     parser.add_argument("--cond-drop-prob", type=float, default=0.1)
     parser.add_argument("--dur-weight", type=float, default=0.1)
     parser.add_argument("--no-duration-predictor", action="store_true")
+    parser.add_argument("--no-condition-encoder", action="store_true", help="use zero conditioning and skip the text/prosody encoder path")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-frames", type=int, default=256, help="training crop length in latent frames")
+    parser.add_argument("--full-samples", action="store_true", help="disable random crops and train on complete latent sequences")
     parser.add_argument("--min-frames", type=int, default=16, help="minimum latent frames to keep a sample")
     parser.add_argument("--max-samples", type=int, default=None, help="limit dataset size for smoke tests")
     parser.add_argument("--num-workers", type=int, default=4)
@@ -555,6 +644,7 @@ def main():
     parser.add_argument("--eval-frames", type=int, default=256)
     parser.add_argument("--sample-steps", type=int, default=6)
     parser.add_argument("--sample-solver", type=str, default="dpm2", choices=["euler", "heun", "dpm2"])
+    parser.add_argument("--sample-t-start", type=float, default=0.0, help="inference lower time; useful for skipping unstable t=0 endpoint")
     parser.add_argument("--cfg-scale", type=float, default=1.5)
     parser.add_argument("--t-sampling", type=str, default="beta", choices=["beta", "uniform", "logit_normal"])
     parser.add_argument("--beta-alpha", type=float, default=2.0)
@@ -563,7 +653,15 @@ def main():
     parser.add_argument("--logit-scale", type=float, default=1.0)
     parser.add_argument("--t-eps", type=float, default=1e-4)
     parser.add_argument("--t-min", type=float, default=0.0, help="minimum training flow time for staged t warmup")
+    parser.add_argument("--t-min-start", type=float, default=None, help="curriculum start value for minimum flow time")
+    parser.add_argument("--t-min-end", type=float, default=None, help="curriculum end value for minimum flow time")
+    parser.add_argument("--t-min-warmup-steps", type=int, default=0, help="steps used to move t_min_start to t_min_end")
+    parser.add_argument("--t-min-schedule", type=str, default="linear", choices=["linear", "cosine"])
     parser.add_argument("--min-snr-gamma", type=float, default=5.0)
+    parser.add_argument("--noise-init", type=str, default="gaussian", choices=["gaussian", "pca"], help="base distribution for flow start x0")
+    parser.add_argument("--pca-path", type=str, default=None, help="NPZ with frame-level PCA directions/eigenvalues for PCA-shaped base noise")
+    parser.add_argument("--pca-variance-scale", type=float, default=1.0, help="scale applied to PCA eigenvalue/score variance")
+    parser.add_argument("--pca-no-mean", action="store_true", help="do not include PCA latent mean in the base distribution")
     parser.add_argument("--amp-dtype", type=str, default="bf16", choices=["bf16", "fp16"])
     parser.add_argument("--no-amp", action="store_true")
     args = parser.parse_args()
@@ -581,12 +679,41 @@ def main():
         dit_n_heads=args.dit_heads,
         cond_drop_prob=args.cond_drop_prob,
         use_duration_predictor=not args.no_duration_predictor,
+        use_condition_encoder=not args.no_condition_encoder,
     ).to(device)
     
     n_params = sum(p.numel() for p in model.parameters())
     dit_params = sum(p.numel() for p in model.dit.parameters())
     print(f"Model: {n_params/1e6:.2f}M params", flush=True)
     print(f"  DiT Head: {dit_params/1e6:.2f}M", flush=True)
+
+    if args.noise_init == "pca":
+        if not args.pca_path:
+            raise ValueError("--noise-init pca requires --pca-path")
+        pca_data = np.load(args.pca_path)
+        components_np = pca_data["components"].astype("float32")
+        if "pca_score_std" in pca_data:
+            score_std_np = pca_data["pca_score_std"].astype("float32")
+        else:
+            score_std_np = np.sqrt(pca_data["eigenvalues"].astype("float32"))
+        pca_mean_np = pca_data["mean"].astype("float32")
+        latent_mean, latent_std = stats_vectors(args.stats_path, args.latent_dim)
+        model.configure_pca_noise(
+            components=torch.from_numpy(components_np).to(device),
+            score_std=torch.from_numpy(score_std_np).to(device),
+            pca_mean=torch.from_numpy(pca_mean_np).to(device),
+            latent_mean=latent_mean.to(device),
+            latent_std=latent_std.to(device),
+            variance_scale=args.pca_variance_scale,
+            use_mean=not args.pca_no_mean,
+        )
+        print(
+            f"  Noise init: PCA-shaped k={components_np.shape[0]} variance_scale={args.pca_variance_scale} "
+            f"use_mean={not args.pca_no_mean}",
+            flush=True,
+        )
+    else:
+        print("  Noise init: gaussian", flush=True)
     
     start_step = 0
     
@@ -700,6 +827,7 @@ def main():
         preload_latents=args.preload or args.preload_gpu,
         preload_to_gpu=args.preload_gpu,
         max_samples=args.max_samples,
+        full_samples=args.full_samples,
     )
     print(f"Train samples: {len(train_loader.dataset)}", flush=True)
     
@@ -711,8 +839,16 @@ def main():
     print(f"\n[FM-DiT {args.model_version}] V16 autoencoder latent flow", flush=True)
     print(f"  phoneme_dim=512, pitch/energy_dim=128, cond_dim=512", flush=True)
     print(f"  latent_dim={args.latent_dim} (I/O), model_dim={model.model_dim} (DiT internal)", flush=True)
-    print(f"  max_frames={args.max_frames}, min_frames={args.min_frames}", flush=True)
+    print(f"  max_frames={args.max_frames}, min_frames={args.min_frames}, full_samples={args.full_samples}", flush=True)
+    print(f"  condition_encoder={model.use_condition_encoder}, duration_predictor={model.use_duration_predictor}", flush=True)
     print(f"  t_sampling={args.t_sampling}, t_min={args.t_min}, min_snr_gamma={args.min_snr_gamma}", flush=True)
+    if args.t_min_start is not None or args.t_min_end is not None:
+        print(
+            f"  t_min_curriculum={args.t_min_start if args.t_min_start is not None else args.t_min}"
+            f" -> {args.t_min_end if args.t_min_end is not None else args.t_min}"
+            f" over {args.t_min_warmup_steps} steps ({args.t_min_schedule})",
+            flush=True,
+        )
     print(f"  batch_size={args.batch_size}, grad_accum_steps={args.grad_accum_steps}", flush=True)
     print(f"  DiT: SA + Conv (每层), 无 Cross-Attention", flush=True)
     print(f"  条件注入: 输入加法 + Per-Token AdaLN", flush=True)
@@ -743,6 +879,14 @@ def main():
             phoneme_ids = batch["phoneme_ids"].to(device, non_blocking=True)
             gt_duration = batch["phoneme_durations"].to(device, non_blocking=True)
             frame_lengths = batch["frame_lengths"].to(device, non_blocking=True)
+            current_t_min = scheduled_t_min(
+                step + 1,
+                args.t_min,
+                args.t_min_start,
+                args.t_min_end,
+                args.t_min_warmup_steps,
+                args.t_min_schedule,
+            )
             
             with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype):
                 loss_fm, loss_dur = model(
@@ -755,7 +899,7 @@ def main():
                     logit_loc=args.logit_loc,
                     logit_scale=args.logit_scale,
                     t_eps=args.t_eps,
-                    t_min=args.t_min,
+                    t_min=current_t_min,
                     min_snr_gamma=args.min_snr_gamma,
                 )
                 loss = (loss_fm + args.dur_weight * loss_dur) / args.grad_accum_steps
@@ -780,7 +924,15 @@ def main():
             gate_stats = model.dit.get_gate_stats()
             gate_str = " ".join([f"g{k}={v:.2f}" if isinstance(v, float) else f"g{k}={v}" for k, v in gate_stats.items()])
             
-            print(f"Step {step+1}/{args.steps} | FM: {avg_fm:.4f} | Dur: {avg_dur:.4f} | {gate_str} | LR: {lr:.2e} | {speed:.1f} steps/s", flush=True)
+            log_t_min = scheduled_t_min(
+                step + 1,
+                args.t_min,
+                args.t_min_start,
+                args.t_min_end,
+                args.t_min_warmup_steps,
+                args.t_min_schedule,
+            )
+            print(f"Step {step+1}/{args.steps} | FM: {avg_fm:.4f} | Dur: {avg_dur:.4f} | t_min={log_t_min:.3f} | {gate_str} | LR: {lr:.2e} | {speed:.1f} steps/s", flush=True)
             running_loss_fm = 0.0
             running_loss_dur = 0.0
             running_micro = 0
@@ -819,6 +971,7 @@ def main():
                     latent_mean=latent_mean, latent_std=latent_std,
                     solver=args.sample_solver,
                     frame_lengths=eval_lengths,
+                    t_start=args.sample_t_start,
                 )
                 
                 orig_latent = torch.load(eval_item['latent_path'], weights_only=True)
@@ -881,6 +1034,7 @@ def main():
             latent_mean=test_latent_mean, latent_std=test_latent_std,
             solver=args.sample_solver,
             frame_lengths=frame_lengths,
+            t_start=args.sample_t_start,
         )
         
         orig = train_loader.dataset._to_time_channel(orig_latent)

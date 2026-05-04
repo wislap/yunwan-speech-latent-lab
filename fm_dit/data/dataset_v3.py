@@ -31,10 +31,12 @@ class TTSDatasetV3(Dataset):
         preload_latents: bool = False,  # 预加载 latent 到内存
         preload_to_gpu: bool = False,  # 预加载到 GPU 显存
         max_samples: Optional[int] = None,
+        full_samples: bool = False,
     ):
         self.manifest_path = Path(manifest_path)
         self.max_frames = max_frames
         self.min_frames = min_frames
+        self.full_samples = full_samples
         self.preload_latents = preload_latents
         self.preload_to_gpu = preload_to_gpu
         self.gpu_device = torch.device('cuda') if preload_to_gpu and torch.cuda.is_available() else None
@@ -76,6 +78,8 @@ class TTSDatasetV3(Dataset):
         self.latent_cache = {}
         self.cond_cache = {}  # 条件数据缓存
         if preload_latents:
+            if full_samples or max_frames <= 0:
+                raise ValueError("preload_latents requires fixed max_frames; disable preload for full-sample training")
             device_str = "GPU" if preload_to_gpu else "memory"
             print(f"Preloading {len(self.items)} samples to {device_str} (pre-padded to {max_frames})...")
             for item in self.items:
@@ -200,8 +204,9 @@ class TTSDatasetV3(Dataset):
             else:
                 energy = torch.cat([energy, torch.zeros(T - len(energy))])
         
-        # 随机截取 (训练时)
-        if T > self.max_frames:
+        # 随机截取 (训练时). Full-sample mode keeps complete sequences and
+        # relies on collate padding plus frame_lengths masking.
+        if not self.full_samples and self.max_frames > 0 and T > self.max_frames:
             start = random.randint(0, T - self.max_frames)
             end = start + self.max_frames
             
@@ -470,6 +475,7 @@ def get_dataloader_v3(
     preload_latents: bool = False,
     preload_to_gpu: bool = False,
     max_samples: Optional[int] = None,
+    full_samples: bool = False,
 ) -> DataLoader:
     """创建 v3 DataLoader"""
     dataset = TTSDatasetV3(
@@ -480,6 +486,7 @@ def get_dataloader_v3(
         preload_latents=preload_latents,
         preload_to_gpu=preload_to_gpu,
         max_samples=max_samples,
+        full_samples=full_samples,
     )
     
     # 如果预加载到 GPU，不需要 num_workers

@@ -6,13 +6,14 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import soundfile as sf
 import torch
 import torch.nn.functional as F
 from scipy.signal import resample_poly
 
 from autoencoder.models.autoencoder import WavVAE
-from fm_dit.train_v1_v16ae import FMDiTV16AE
+from fm_dit.train_v1_v16ae import FMDiTV16AE, stats_vectors
 
 
 def load_audio(path: str, sr: int) -> torch.Tensor:
@@ -64,7 +65,7 @@ def load_ae(checkpoint: Path, latent_dim: int, strides: list[int], device: torch
     return model.to(device).eval()
 
 
-def load_dit(checkpoint: Path, device: torch.device) -> FMDiTV16AE:
+def load_dit(checkpoint: Path, device: torch.device) -> tuple[FMDiTV16AE, dict]:
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
     args = ckpt.get("args", {})
     model = FMDiTV16AE(
@@ -75,9 +76,37 @@ def load_dit(checkpoint: Path, device: torch.device) -> FMDiTV16AE:
         dit_n_heads=int(args.get("dit_heads", 8)),
         cond_drop_prob=float(args.get("cond_drop_prob", 0.1)),
         use_duration_predictor=not bool(args.get("no_duration_predictor", False)),
+        use_condition_encoder=not bool(args.get("no_condition_encoder", False)),
     )
     model.load_state_dict(ckpt["model"])
-    return model.to(device).eval()
+    return model.to(device).eval(), args
+
+
+def configure_pca_noise(
+    model: FMDiTV16AE,
+    pca_path: Path,
+    stats_path: Path,
+    variance_scale: float,
+    use_mean: bool,
+    device: torch.device,
+) -> None:
+    data = np.load(pca_path)
+    components = torch.from_numpy(data["components"].astype("float32")).to(device)
+    if "pca_score_std" in data:
+        score_std = torch.from_numpy(data["pca_score_std"].astype("float32")).to(device)
+    else:
+        score_std = torch.from_numpy(np.sqrt(data["eigenvalues"].astype("float32"))).to(device)
+    pca_mean = torch.from_numpy(data["mean"].astype("float32")).to(device)
+    latent_mean, latent_std = stats_vectors(str(stats_path), model.latent_dim)
+    model.configure_pca_noise(
+        components=components,
+        score_std=score_std,
+        pca_mean=pca_mean,
+        latent_mean=latent_mean.to(device),
+        latent_std=latent_std.to(device),
+        variance_scale=variance_scale,
+        use_mean=use_mean,
+    )
 
 
 def main() -> None:
@@ -91,6 +120,10 @@ def main() -> None:
     parser.add_argument("--cfg-scales", type=str, default="1.0,1.5,2.0")
     parser.add_argument("--sample-steps", type=int, default=32)
     parser.add_argument("--sample-solver", type=str, default="dpm2", choices=["euler", "heun", "dpm2"])
+    parser.add_argument("--sample-t-start", type=float, default=0.0)
+    parser.add_argument("--pca-path", type=Path, default=None)
+    parser.add_argument("--pca-variance-scale", type=float, default=1.0)
+    parser.add_argument("--pca-no-mean", action="store_true")
     parser.add_argument("--latent-dim", type=int, default=384)
     parser.add_argument("--strides", type=str, default="2,4,4,8")
     parser.add_argument("--sr", type=int, default=22050)
@@ -110,7 +143,19 @@ def main() -> None:
     cfg_scales = [float(x) for x in args.cfg_scales.split(",") if x.strip()]
 
     ae = load_ae(args.ae_checkpoint, args.latent_dim, strides, device)
-    dit = load_dit(args.dit_checkpoint, device)
+    dit, dit_args = load_dit(args.dit_checkpoint, device)
+    pca_path = args.pca_path
+    if pca_path is None and dit_args.get("noise_init") == "pca" and dit_args.get("pca_path"):
+        pca_path = Path(dit_args["pca_path"])
+    if pca_path is not None:
+        configure_pca_noise(
+            dit,
+            pca_path,
+            args.stats,
+            args.pca_variance_scale,
+            not args.pca_no_mean,
+            device,
+        )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     report = {
@@ -119,6 +164,8 @@ def main() -> None:
         "ae_checkpoint": str(args.ae_checkpoint),
         "sample_steps": args.sample_steps,
         "sample_solver": args.sample_solver,
+        "sample_t_start": args.sample_t_start,
+        "pca_path": str(pca_path) if pca_path else None,
         "seed": args.seed,
         "items": [],
     }
@@ -167,6 +214,7 @@ def main() -> None:
                     latent_std=latent_std,
                     solver=args.sample_solver,
                     frame_lengths=frame_lengths,
+                    t_start=args.sample_t_start,
                 )
                 pred_z = pred_latent.transpose(1, 2).to(device)
                 pred_audio = ae.decode(pred_z, output_length=output_length).squeeze(0).squeeze(0)
