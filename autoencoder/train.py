@@ -663,6 +663,32 @@ def train(args: DictConfig) -> None:
             speaker_weight=float(args.get("v17_ext_speaker_weight", 0.0)),
             style_weight=float(args.get("v17_ext_style_weight", 0.0)),
             speed_weight=float(args.get("v17_ext_speed_weight", 0.1)),
+            semantic_weight=float(args.get("v17_semantic_weight", 0.0)),
+            semantic_hidden_dim=int(args.get("v17_semantic_hidden_dim", 384)),
+            semantic_proj_dim=int(args.get("v17_semantic_proj_dim", 192)),
+            semantic_depth=int(args.get("v17_semantic_depth", 4)),
+            semantic_infonce_weight=float(args.get("v17_semantic_infonce_weight", 1.0)),
+            semantic_js_weight=float(args.get("v17_semantic_js_weight", 0.1)),
+            semantic_temperature=float(args.get("v17_semantic_temperature", 0.12)),
+            semantic_queue_size=int(args.get("v17_semantic_queue_size", 256)),
+            semantic_positive_key=str(args.get("v17_semantic_positive_key", "same_text_group")),
+            semantic_detach_adapter_latent=bool(args.get("v17_semantic_detach_adapter_latent", False)),
+            cross_factor_weight=float(args.get("v17_cross_factor_weight", 0.0)),
+            cross_factor_hidden_dim=int(args.get("v17_cross_factor_hidden_dim", 384)),
+            cross_factor_phoneme_dim=int(args.get("v17_cross_factor_phoneme_dim", 192)),
+            cross_factor_speaker_dim=int(args.get("v17_cross_factor_speaker_dim", 64)),
+            cross_factor_queue_size=int(args.get("v17_cross_factor_queue_size", 256)),
+            cross_factor_positive_key=str(args.get("v17_cross_factor_positive_key", "same_text_group")),
+            cross_factor_phoneme_weight=float(args.get("v17_cross_factor_phoneme_weight", 1.0)),
+            cross_factor_phoneme_nce_weight=float(args.get("v17_cross_factor_phoneme_nce_weight", 1.0)),
+            cross_factor_phoneme_temperature=float(args.get("v17_cross_factor_phoneme_temperature", 0.12)),
+            cross_factor_phoneme_uniform_weight=float(args.get("v17_cross_factor_phoneme_uniform_weight", 0.05)),
+            cross_factor_phoneme_soft_weight=float(args.get("v17_cross_factor_phoneme_soft_weight", 1.0)),
+            cross_factor_phoneme_soft_hard_weight=float(args.get("v17_cross_factor_phoneme_soft_hard_weight", 2.0)),
+            cross_factor_phoneme_soft_text_buckets=int(args.get("v17_cross_factor_phoneme_soft_text_buckets", 512)),
+            cross_factor_speaker_weight=float(args.get("v17_cross_factor_speaker_weight", 1.0)),
+            cross_factor_speaker_target_cos=float(args.get("v17_cross_factor_speaker_target_cos", -1.0)),
+            cross_factor_detach_latent=bool(args.get("v17_cross_factor_detach_latent", False)),
             flow_hidden_dim=int(args.get("v17_flow_hidden_dim", 512)),
             flow_depth=int(args.get("v17_flow_depth", 4)),
             external_detach_latent=bool(args.get("v17_external_detach_latent", False)),
@@ -673,6 +699,8 @@ def train(args: DictConfig) -> None:
         print(
             "  V17 constraints: "
             f"ext_weight={float(args.get('v17_ext_weight', 0.0))}, "
+            f"semantic_weight={float(args.get('v17_semantic_weight', 0.0))}, "
+            f"cross_factor_weight={float(args.get('v17_cross_factor_weight', 0.0))}, "
             f"flow_weight={float(args.get('v17_flow_weight', 0.0))}, "
             f"params={count_parameters(v17_constraints):,}"
         )
@@ -1134,6 +1162,29 @@ def train(args: DictConfig) -> None:
                     )
                     if "v17_ext_total" in v17_logs:
                         msg += f" ext={v17_logs['v17_ext_total'].item():.4f}"
+                    if "v17_semantic_total" in v17_logs:
+                        msg += (
+                            f" sem={v17_logs['v17_semantic_total'].item():.4f}"
+                            f"/nce={v17_logs['v17_semantic_infonce'].item():.4f}"
+                            f"/top1={v17_logs['v17_semantic_top1'].item():.2f}"
+                            f"/pos={v17_logs['v17_semantic_pos'].item():.1f}"
+                            f"/xpos={v17_logs['v17_semantic_cross_pos'].item():.1f}"
+                        )
+                    if "v17_cross_factor_total" in v17_logs:
+                        msg += (
+                            f" cross={v17_logs['v17_cross_factor_total'].item():.4f}"
+                            f"/ph={v17_logs['v17_cross_phoneme'].item():.4f}"
+                            f"/nce={v17_logs['v17_cross_phoneme_nce'].item():.4f}"
+                            f"/soft={v17_logs['v17_cross_phoneme_soft'].item():.4f}"
+                            f"/uni={v17_logs['v17_cross_phoneme_uniform'].item():.4f}"
+                            f"/sp={v17_logs['v17_cross_speaker_opp'].item():.4f}"
+                            f"/pairs={v17_logs['v17_cross_pairs'].item():.0f}"
+                            f"/npos={v17_logs['v17_cross_nce_pos'].item():.0f}"
+                            f"/ntop1={v17_logs['v17_cross_phoneme_top1'].item():.2f}"
+                            f"/phcos={v17_logs['v17_cross_phoneme_cos'].item():.2f}"
+                            f"/spcos={v17_logs['v17_cross_speaker_cos'].item():.2f}"
+                            f"/sneg={v17_logs['v17_cross_soft_neg_cos'].item():.2f}->{v17_logs['v17_cross_soft_neg_target'].item():.2f}"
+                        )
                     if "v17_flow" in v17_logs:
                         msg += f" flow={v17_logs['v17_flow'].item():.4f}"
                 if use_adv:

@@ -18,6 +18,11 @@ def _stable_bucket(value: str, buckets: int) -> int:
     return int.from_bytes(digest[:8], "little") % buckets
 
 
+def _stable_int(value: str) -> int:
+    digest = hashlib.sha1(value.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "little", signed=False) & ((1 << 63) - 1)
+
+
 def _metadata_list(metadata: Any, batch_size: int) -> list[dict]:
     if isinstance(metadata, list):
         return [m if isinstance(m, dict) else {} for m in metadata]
@@ -33,6 +38,65 @@ def _metadata_list(metadata: Any, batch_size: int) -> list[dict]:
             rows.append(row)
         return rows
     return [{} for _ in range(batch_size)]
+
+
+def _masked_logsumexp(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    neg_inf = torch.finfo(logits.dtype).min
+    return torch.logsumexp(logits.masked_fill(~mask, neg_inf), dim=dim)
+
+
+def _masked_infonce(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    positive_mask: torch.Tensor,
+    temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    logits = query @ key.T / max(float(temperature), 1e-4)
+    all_mask = torch.ones_like(positive_mask, dtype=torch.bool)
+    valid = positive_mask.any(dim=1)
+    if not bool(valid.any()):
+        zero = query.sum() * 0.0
+        return zero, torch.tensor(0.0, device=query.device)
+    log_pos = _masked_logsumexp(logits, positive_mask, dim=1)
+    log_all = _masked_logsumexp(logits, all_mask, dim=1)
+    loss = -(log_pos[valid] - log_all[valid]).mean()
+    with torch.no_grad():
+        top1 = positive_mask.gather(1, logits.argmax(dim=1, keepdim=True)).float()
+        acc = top1[valid].mean() if bool(valid.any()) else torch.tensor(0.0, device=query.device)
+    return loss, acc
+
+
+def _pairwise_js_loss(a: torch.Tensor, b: torch.Tensor, temperature: float) -> torch.Tensor:
+    if a.shape[0] < 2:
+        return a.sum() * 0.0
+    temp = max(float(temperature), 1e-4)
+    sim_a = (a @ a.T) / temp
+    sim_b = (b @ b.T) / temp
+    eye = torch.eye(a.shape[0], device=a.device, dtype=torch.bool)
+    sim_a = sim_a.masked_fill(eye, torch.finfo(sim_a.dtype).min)
+    sim_b = sim_b.masked_fill(eye, torch.finfo(sim_b.dtype).min)
+    log_pa = F.log_softmax(sim_a, dim=-1)
+    log_pb = F.log_softmax(sim_b, dim=-1)
+    pa = log_pa.exp()
+    pb = log_pb.exp()
+    m = 0.5 * (pa + pb)
+    js = 0.5 * F.kl_div(log_pa, m, reduction="batchmean") + 0.5 * F.kl_div(log_pb, m, reduction="batchmean")
+    return js
+
+
+def _row_text_key(row: dict, positive_key: str = "same_text_group") -> str:
+    return str(
+        row.get(positive_key)
+        or row.get("same_text_group")
+        or row.get("text_id")
+        or row.get("text")
+        or row.get("id")
+        or ""
+    )
+
+
+def _row_speaker_key(row: dict) -> str:
+    return str(row.get("same_speaker_group") or row.get("speaker_id") or row.get("speaker") or "")
 
 
 class PinyinToneEncoder:
@@ -316,6 +380,440 @@ class ExternalAdapterConstraint(nn.Module):
         return total, losses
 
 
+class ResidualTemporalBlock(nn.Module):
+    def __init__(self, hidden_dim: int, kernel_size: int = 5, dilation: int = 1):
+        super().__init__()
+        padding = dilation * (kernel_size - 1) // 2
+        self.norm = nn.GroupNorm(8, hidden_dim)
+        self.conv = nn.Conv1d(hidden_dim, hidden_dim, kernel_size, padding=padding, dilation=dilation)
+        self.ff = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.silu(self.norm(x))
+        h = self.conv(h)
+        h = F.silu(h)
+        h = self.ff(h)
+        return x + h / math.sqrt(2.0)
+
+
+class SameModalityEncoderAdapterConstraint(nn.Module):
+    """Learned same-modality encoder target with adapter-side alignment.
+
+    The target encoder receives detached AE latents and forms an external
+    same-modality anchor. The adapter path can send gradients back into the AE
+    latent when detach_adapter_latent=False. A small memory queue keeps
+    contrastive positives useful even when audio batches are size 1.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int = 384,
+        proj_dim: int = 192,
+        depth: int = 4,
+        weight: float = 0.0,
+        infonce_weight: float = 1.0,
+        js_weight: float = 0.1,
+        temperature: float = 0.12,
+        queue_size: int = 256,
+        positive_key: str = "same_text_group",
+        detach_adapter_latent: bool = False,
+    ):
+        super().__init__()
+        self.weight = weight
+        self.infonce_weight = infonce_weight
+        self.js_weight = js_weight
+        self.temperature = temperature
+        self.queue_size = queue_size
+        self.positive_key = positive_key
+        self.detach_adapter_latent = detach_adapter_latent
+
+        self.target_in = nn.Conv1d(latent_dim, hidden_dim, kernel_size=1)
+        self.target_blocks = nn.ModuleList(
+            [ResidualTemporalBlock(hidden_dim, dilation=2 ** (i % 3)) for i in range(depth)]
+        )
+        self.target_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+        self.adapter_in = nn.Conv1d(latent_dim, hidden_dim, kernel_size=1)
+        self.adapter_blocks = nn.ModuleList(
+            [ResidualTemporalBlock(hidden_dim, dilation=2 ** (i % 3)) for i in range(max(depth // 2, 1))]
+        )
+        self.adapter_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, proj_dim),
+        )
+
+        self.register_buffer("queue_features", torch.zeros(queue_size, proj_dim), persistent=True)
+        self.register_buffer("queue_keys", torch.full((queue_size,), -1, dtype=torch.long), persistent=True)
+        self.register_buffer("queue_ptr", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("queue_filled", torch.zeros((), dtype=torch.long), persistent=True)
+
+    def _pool(self, h: torch.Tensor) -> torch.Tensor:
+        return h.mean(dim=-1)
+
+    def _encode_target(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.target_in(z.detach().float())
+        for block in self.target_blocks:
+            h = block(h)
+        return F.normalize(self.target_proj(self._pool(h)), dim=-1)
+
+    def _encode_adapter(self, z: torch.Tensor) -> torch.Tensor:
+        z_in = z.detach() if self.detach_adapter_latent else z
+        h = self.adapter_in(z_in.float())
+        for block in self.adapter_blocks:
+            h = block(h)
+        return F.normalize(self.adapter_proj(self._pool(h)), dim=-1)
+
+    def _positive_ids(self, metadata: Any, batch_size: int, device: torch.device) -> torch.Tensor:
+        rows = _metadata_list(metadata, batch_size)
+        values = []
+        for row in rows:
+            values.append(_stable_int(_row_text_key(row, self.positive_key)))
+        return torch.tensor(values, device=device, dtype=torch.long)
+
+    @torch.no_grad()
+    def _enqueue(self, features: torch.Tensor, keys: torch.Tensor) -> None:
+        if self.queue_size <= 0:
+            return
+        features = features.detach()
+        keys = keys.detach()
+        n = features.shape[0]
+        if n == 0:
+            return
+        if n >= self.queue_size:
+            self.queue_features.copy_(features[-self.queue_size :])
+            self.queue_keys.copy_(keys[-self.queue_size :])
+            self.queue_ptr.zero_()
+            self.queue_filled.fill_(self.queue_size)
+            return
+        ptr = int(self.queue_ptr.item())
+        end = ptr + n
+        if end <= self.queue_size:
+            self.queue_features[ptr:end].copy_(features)
+            self.queue_keys[ptr:end].copy_(keys)
+        else:
+            first = self.queue_size - ptr
+            self.queue_features[ptr:].copy_(features[:first])
+            self.queue_keys[ptr:].copy_(keys[:first])
+            self.queue_features[: end - self.queue_size].copy_(features[first:])
+            self.queue_keys[: end - self.queue_size].copy_(keys[first:])
+        self.queue_ptr.fill_(end % self.queue_size)
+        self.queue_filled.fill_(min(self.queue_size, int(self.queue_filled.item()) + n))
+
+    def forward(self, z: torch.Tensor, metadata: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        b = z.shape[0]
+        device = z.device
+        query = self._encode_adapter(z)
+        key = self._encode_target(z)
+        ids = self._positive_ids(metadata, b, device)
+
+        bank_n = int(self.queue_filled.item())
+        if bank_n > 0:
+            bank_features = self.queue_features[:bank_n].to(device=device, dtype=key.dtype)
+            bank_keys = self.queue_keys[:bank_n].to(device=device)
+            all_keys = torch.cat([key, bank_features], dim=0)
+            all_ids = torch.cat([ids, bank_keys], dim=0)
+        else:
+            all_keys = key
+            all_ids = ids
+
+        positive_mask = ids[:, None].eq(all_ids[None, :])
+        own = torch.arange(b, device=device)
+        own_mask = torch.zeros_like(positive_mask)
+        own_mask[own, own] = True
+        cross_positive_mask = positive_mask & ~own_mask
+        has_cross_positive = cross_positive_mask.any(dim=1, keepdim=True)
+        positive_mask = torch.where(has_cross_positive, cross_positive_mask, own_mask)
+
+        nce, acc = _masked_infonce(query, all_keys, positive_mask, self.temperature)
+        js = _pairwise_js_loss(query, key, self.temperature)
+        total = self.infonce_weight * nce + self.js_weight * js
+
+        with torch.no_grad():
+            positives = positive_mask.sum(dim=1).float().mean()
+            cross_positives = cross_positive_mask.sum(dim=1).float().mean()
+            self._enqueue(key, ids)
+
+        logs = {
+            "v17_semantic_total": total,
+            "v17_semantic_infonce": nce,
+            "v17_semantic_js": js,
+            "v17_semantic_top1": acc.detach(),
+            "v17_semantic_pos": positives.detach(),
+            "v17_semantic_cross_pos": cross_positives.detach(),
+            "v17_semantic_queue": torch.tensor(float(bank_n), device=device),
+        }
+        return total, logs
+
+
+class CrossSampleFactorAlignmentConstraint(nn.Module):
+    """Cross-sample phoneme/speaker factor constraint for crossed data.
+
+    For queued samples with the same phoneme/text key but a different speaker:
+    - phoneme projection is pulled together.
+    - speaker projection is pushed toward the opposite direction.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        hidden_dim: int = 384,
+        phoneme_dim: int = 192,
+        speaker_dim: int = 64,
+        queue_size: int = 256,
+        positive_key: str = "same_text_group",
+        phoneme_weight: float = 1.0,
+        phoneme_nce_weight: float = 1.0,
+        phoneme_temperature: float = 0.12,
+        phoneme_uniform_weight: float = 0.05,
+        phoneme_soft_weight: float = 1.0,
+        phoneme_soft_hard_weight: float = 2.0,
+        phoneme_soft_text_buckets: int = 512,
+        speaker_opposite_weight: float = 1.0,
+        speaker_target_cos: float = -1.0,
+        detach_latent: bool = False,
+    ):
+        super().__init__()
+        self.queue_size = queue_size
+        self.positive_key = positive_key
+        self.phoneme_weight = phoneme_weight
+        self.phoneme_nce_weight = phoneme_nce_weight
+        self.phoneme_temperature = phoneme_temperature
+        self.phoneme_uniform_weight = phoneme_uniform_weight
+        self.phoneme_soft_weight = phoneme_soft_weight
+        self.phoneme_soft_hard_weight = phoneme_soft_hard_weight
+        self.phoneme_text_buckets = phoneme_soft_text_buckets
+        self.speaker_opposite_weight = speaker_opposite_weight
+        self.speaker_target_cos = speaker_target_cos
+        self.detach_latent = detach_latent
+        self.pinyin = PinyinToneEncoder(buckets=phoneme_soft_text_buckets)
+
+        self.norm = nn.LayerNorm(latent_dim)
+        self.trunk = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.phoneme_head = nn.Linear(hidden_dim, phoneme_dim)
+        self.speaker_head = nn.Linear(hidden_dim, speaker_dim)
+
+        self.register_buffer("queue_phoneme", torch.zeros(queue_size, phoneme_dim), persistent=True)
+        self.register_buffer("queue_speaker", torch.zeros(queue_size, speaker_dim), persistent=True)
+        self.register_buffer("queue_text_vec", torch.zeros(queue_size, phoneme_soft_text_buckets), persistent=True)
+        self.register_buffer("queue_text_keys", torch.full((queue_size,), -1, dtype=torch.long), persistent=True)
+        self.register_buffer("queue_speaker_keys", torch.full((queue_size,), -1, dtype=torch.long), persistent=True)
+        self.register_buffer("queue_ptr", torch.zeros((), dtype=torch.long), persistent=True)
+        self.register_buffer("queue_filled", torch.zeros((), dtype=torch.long), persistent=True)
+
+    def _encode(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z_in = z.detach() if self.detach_latent else z
+        pooled = z_in.mean(dim=-1).float()
+        h = self.trunk(self.norm(pooled))
+        phoneme = F.normalize(self.phoneme_head(h), dim=-1)
+        speaker = F.normalize(self.speaker_head(h), dim=-1)
+        return phoneme, speaker
+
+    def _keys(self, metadata: Any, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        rows = _metadata_list(metadata, batch_size)
+        text = [_stable_int(_row_text_key(row, self.positive_key)) for row in rows]
+        speaker = [_stable_int(_row_speaker_key(row)) for row in rows]
+        return (
+            torch.tensor(text, device=device, dtype=torch.long),
+            torch.tensor(speaker, device=device, dtype=torch.long),
+        )
+
+    def _text_vectors(self, metadata: Any, batch_size: int, device: torch.device) -> torch.Tensor:
+        rows = _metadata_list(metadata, batch_size)
+        vectors = []
+        for row in rows:
+            text = str(row.get("text", ""))
+            ids = self.pinyin.ids(text)
+            vec = torch.zeros(self.phoneme_text_buckets, device=device, dtype=torch.float32)
+            if ids:
+                idx = torch.tensor(ids, device=device, dtype=torch.long).clamp(0, self.phoneme_text_buckets - 1)
+                vec.scatter_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+            else:
+                vec[0] = 1.0
+            vec = vec / vec.norm().clamp_min(1e-6)
+            vectors.append(vec)
+        return torch.stack(vectors, dim=0)
+
+    @torch.no_grad()
+    def _enqueue(
+        self,
+        phoneme: torch.Tensor,
+        speaker: torch.Tensor,
+        text_vec: torch.Tensor,
+        text_keys: torch.Tensor,
+        speaker_keys: torch.Tensor,
+    ) -> None:
+        if self.queue_size <= 0:
+            return
+        phoneme = phoneme.detach()
+        speaker = speaker.detach()
+        text_vec = text_vec.detach()
+        text_keys = text_keys.detach()
+        speaker_keys = speaker_keys.detach()
+        n = phoneme.shape[0]
+        if n == 0:
+            return
+        if n >= self.queue_size:
+            self.queue_phoneme.copy_(phoneme[-self.queue_size :])
+            self.queue_speaker.copy_(speaker[-self.queue_size :])
+            self.queue_text_vec.copy_(text_vec[-self.queue_size :])
+            self.queue_text_keys.copy_(text_keys[-self.queue_size :])
+            self.queue_speaker_keys.copy_(speaker_keys[-self.queue_size :])
+            self.queue_ptr.zero_()
+            self.queue_filled.fill_(self.queue_size)
+            return
+
+        ptr = int(self.queue_ptr.item())
+        end = ptr + n
+        if end <= self.queue_size:
+            self.queue_phoneme[ptr:end].copy_(phoneme)
+            self.queue_speaker[ptr:end].copy_(speaker)
+            self.queue_text_vec[ptr:end].copy_(text_vec)
+            self.queue_text_keys[ptr:end].copy_(text_keys)
+            self.queue_speaker_keys[ptr:end].copy_(speaker_keys)
+        else:
+            first = self.queue_size - ptr
+            rest = end - self.queue_size
+            self.queue_phoneme[ptr:].copy_(phoneme[:first])
+            self.queue_speaker[ptr:].copy_(speaker[:first])
+            self.queue_text_vec[ptr:].copy_(text_vec[:first])
+            self.queue_text_keys[ptr:].copy_(text_keys[:first])
+            self.queue_speaker_keys[ptr:].copy_(speaker_keys[:first])
+            self.queue_phoneme[:rest].copy_(phoneme[first:])
+            self.queue_speaker[:rest].copy_(speaker[first:])
+            self.queue_text_vec[:rest].copy_(text_vec[first:])
+            self.queue_text_keys[:rest].copy_(text_keys[first:])
+            self.queue_speaker_keys[:rest].copy_(speaker_keys[first:])
+        self.queue_ptr.fill_(end % self.queue_size)
+        self.queue_filled.fill_(min(self.queue_size, int(self.queue_filled.item()) + n))
+
+    def forward(self, z: torch.Tensor, metadata: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        b = z.shape[0]
+        device = z.device
+        phoneme, speaker = self._encode(z)
+        text_keys, speaker_keys = self._keys(metadata, b, device)
+        text_vec = self._text_vectors(metadata, b, device)
+
+        bank_n = int(self.queue_filled.item())
+        if bank_n > 0:
+            bank_phoneme = self.queue_phoneme[:bank_n].to(device=device, dtype=phoneme.dtype).clone()
+            bank_speaker = self.queue_speaker[:bank_n].to(device=device, dtype=speaker.dtype).clone()
+            bank_text_vec = self.queue_text_vec[:bank_n].to(device=device, dtype=text_vec.dtype).clone()
+            bank_text = self.queue_text_keys[:bank_n].to(device=device)
+            bank_spk = self.queue_speaker_keys[:bank_n].to(device=device)
+            pair_mask = text_keys[:, None].eq(bank_text[None, :]) & ~speaker_keys[:, None].eq(bank_spk[None, :])
+            nce_positive_mask = text_keys[:, None].eq(bank_text[None, :])
+        else:
+            bank_phoneme = phoneme.new_zeros((0, phoneme.shape[-1]))
+            bank_speaker = speaker.new_zeros((0, speaker.shape[-1]))
+            bank_text_vec = text_vec.new_zeros((0, text_vec.shape[-1]))
+            pair_mask = torch.zeros((b, 0), device=device, dtype=torch.bool)
+            nce_positive_mask = torch.zeros((b, 0), device=device, dtype=torch.bool)
+
+        valid = pair_mask.any(dim=1)
+        if bool(valid.any()):
+            phoneme_cos = phoneme @ bank_phoneme.T
+            speaker_cos = speaker @ bank_speaker.T
+            phoneme_loss = (1.0 - phoneme_cos)[pair_mask].mean()
+            speaker_loss = (speaker_cos[pair_mask] - self.speaker_target_cos).pow(2).mean()
+            phoneme_cos_mean = phoneme_cos[pair_mask].mean()
+            speaker_cos_mean = speaker_cos[pair_mask].mean()
+            pairs = pair_mask.sum().float()
+        else:
+            zero = phoneme.sum() * 0.0
+            phoneme_loss = zero
+            speaker_loss = zero
+            phoneme_cos_mean = zero.detach()
+            speaker_cos_mean = zero.detach()
+            pairs = torch.tensor(0.0, device=device)
+
+        nce_valid = nce_positive_mask.any(dim=1)
+        if bool(nce_valid.any()):
+            phoneme_nce, phoneme_top1 = _masked_infonce(
+                phoneme,
+                bank_phoneme,
+                nce_positive_mask,
+                self.phoneme_temperature,
+            )
+        else:
+            phoneme_nce = phoneme.sum() * 0.0
+            phoneme_top1 = torch.tensor(0.0, device=device)
+
+        if bank_n > 1:
+            all_phoneme = torch.cat([phoneme, bank_phoneme], dim=0)
+            sim = all_phoneme @ all_phoneme.T
+            eye = torch.eye(sim.shape[0], device=device, dtype=torch.bool)
+            # Penalize excessive global similarity. This is zero below the margin
+            # and rises when features collapse into a narrow cone.
+            phoneme_uniform = F.relu(sim.masked_select(~eye) - 0.20).pow(2).mean()
+        else:
+            phoneme_uniform = phoneme.sum() * 0.0
+
+        if bank_n > 0:
+            all_phoneme_cos = phoneme @ bank_phoneme.T
+            target_sim = (text_vec @ bank_text_vec.T).clamp(0.0, 1.0)
+            target_sim = torch.where(nce_positive_mask, torch.ones_like(target_sim), target_sim)
+            hard_weight = 1.0 + self.phoneme_soft_hard_weight * target_sim.detach()
+            phoneme_soft = (F.smooth_l1_loss(all_phoneme_cos, target_sim, reduction="none") * hard_weight).mean()
+            diff_mask = ~nce_positive_mask
+            soft_target_mean = target_sim.mean()
+            soft_cos_mean = all_phoneme_cos.mean()
+            if bool(diff_mask.any()):
+                soft_neg_target_mean = target_sim[diff_mask].mean()
+                soft_neg_cos_mean = all_phoneme_cos[diff_mask].mean()
+            else:
+                soft_neg_target_mean = phoneme.sum() * 0.0
+                soft_neg_cos_mean = phoneme.sum() * 0.0
+        else:
+            phoneme_soft = phoneme.sum() * 0.0
+            soft_target_mean = phoneme.sum() * 0.0
+            soft_cos_mean = phoneme.sum() * 0.0
+            soft_neg_target_mean = phoneme.sum() * 0.0
+            soft_neg_cos_mean = phoneme.sum() * 0.0
+
+        total = (
+            self.phoneme_weight * phoneme_loss
+            + self.phoneme_nce_weight * phoneme_nce
+            + self.phoneme_uniform_weight * phoneme_uniform
+            + self.phoneme_soft_weight * phoneme_soft
+            + self.speaker_opposite_weight * speaker_loss
+        )
+        with torch.no_grad():
+            self._enqueue(phoneme, speaker, text_vec, text_keys, speaker_keys)
+
+        logs = {
+            "v17_cross_factor_total": total,
+            "v17_cross_phoneme": phoneme_loss,
+            "v17_cross_phoneme_nce": phoneme_nce,
+            "v17_cross_phoneme_top1": phoneme_top1.detach(),
+            "v17_cross_phoneme_uniform": phoneme_uniform,
+            "v17_cross_phoneme_soft": phoneme_soft,
+            "v17_cross_soft_target": soft_target_mean.detach(),
+            "v17_cross_soft_cos": soft_cos_mean.detach(),
+            "v17_cross_soft_neg_target": soft_neg_target_mean.detach(),
+            "v17_cross_soft_neg_cos": soft_neg_cos_mean.detach(),
+            "v17_cross_speaker_opp": speaker_loss,
+            "v17_cross_pairs": pairs.detach(),
+            "v17_cross_nce_pos": nce_positive_mask.sum().float().detach(),
+            "v17_cross_phoneme_cos": phoneme_cos_mean.detach(),
+            "v17_cross_speaker_cos": speaker_cos_mean.detach(),
+            "v17_cross_queue": torch.tensor(float(bank_n), device=device),
+        }
+        return total, logs
+
+
 class LatentFlowConstraint(nn.Module):
     """Small conditional flow-matching model over AE latent frames."""
 
@@ -377,6 +875,32 @@ class V17ConstraintModule(nn.Module):
         speaker_weight: float = 0.0,
         style_weight: float = 0.0,
         speed_weight: float = 0.1,
+        semantic_weight: float = 0.0,
+        semantic_hidden_dim: int = 384,
+        semantic_proj_dim: int = 192,
+        semantic_depth: int = 4,
+        semantic_infonce_weight: float = 1.0,
+        semantic_js_weight: float = 0.1,
+        semantic_temperature: float = 0.12,
+        semantic_queue_size: int = 256,
+        semantic_positive_key: str = "same_text_group",
+        semantic_detach_adapter_latent: bool = False,
+        cross_factor_weight: float = 0.0,
+        cross_factor_hidden_dim: int = 384,
+        cross_factor_phoneme_dim: int = 192,
+        cross_factor_speaker_dim: int = 64,
+        cross_factor_queue_size: int = 256,
+        cross_factor_positive_key: str = "same_text_group",
+        cross_factor_phoneme_weight: float = 1.0,
+        cross_factor_phoneme_nce_weight: float = 1.0,
+        cross_factor_phoneme_temperature: float = 0.12,
+        cross_factor_phoneme_uniform_weight: float = 0.05,
+        cross_factor_phoneme_soft_weight: float = 1.0,
+        cross_factor_phoneme_soft_hard_weight: float = 2.0,
+        cross_factor_phoneme_soft_text_buckets: int = 512,
+        cross_factor_speaker_weight: float = 1.0,
+        cross_factor_speaker_target_cos: float = -1.0,
+        cross_factor_detach_latent: bool = False,
         flow_hidden_dim: int = 512,
         flow_depth: int = 4,
         external_detach_latent: bool = False,
@@ -387,6 +911,8 @@ class V17ConstraintModule(nn.Module):
         super().__init__()
         self.ext_weight = ext_weight
         self.flow_weight = flow_weight
+        self.semantic_weight = semantic_weight
+        self.cross_factor_weight = cross_factor_weight
         self.external = ExternalAdapterConstraint(
             latent_dim=latent_dim,
             text_buckets=text_buckets,
@@ -398,6 +924,37 @@ class V17ConstraintModule(nn.Module):
             style_weight=style_weight,
             speed_weight=speed_weight,
             detach_latent=external_detach_latent,
+        )
+        self.semantic = SameModalityEncoderAdapterConstraint(
+            latent_dim=latent_dim,
+            hidden_dim=semantic_hidden_dim,
+            proj_dim=semantic_proj_dim,
+            depth=semantic_depth,
+            weight=semantic_weight,
+            infonce_weight=semantic_infonce_weight,
+            js_weight=semantic_js_weight,
+            temperature=semantic_temperature,
+            queue_size=semantic_queue_size,
+            positive_key=semantic_positive_key,
+            detach_adapter_latent=semantic_detach_adapter_latent,
+        )
+        self.cross_factor = CrossSampleFactorAlignmentConstraint(
+            latent_dim=latent_dim,
+            hidden_dim=cross_factor_hidden_dim,
+            phoneme_dim=cross_factor_phoneme_dim,
+            speaker_dim=cross_factor_speaker_dim,
+            queue_size=cross_factor_queue_size,
+            positive_key=cross_factor_positive_key,
+            phoneme_weight=cross_factor_phoneme_weight,
+            phoneme_nce_weight=cross_factor_phoneme_nce_weight,
+            phoneme_temperature=cross_factor_phoneme_temperature,
+            phoneme_uniform_weight=cross_factor_phoneme_uniform_weight,
+            phoneme_soft_weight=cross_factor_phoneme_soft_weight,
+            phoneme_soft_hard_weight=cross_factor_phoneme_soft_hard_weight,
+            phoneme_soft_text_buckets=cross_factor_phoneme_soft_text_buckets,
+            speaker_opposite_weight=cross_factor_speaker_weight,
+            speaker_target_cos=cross_factor_speaker_target_cos,
+            detach_latent=cross_factor_detach_latent,
         )
         self.flow = LatentFlowConstraint(
             latent_dim=latent_dim,
@@ -411,7 +968,7 @@ class V17ConstraintModule(nn.Module):
 
     @property
     def enabled(self) -> bool:
-        return self.ext_weight > 0 or self.flow_weight > 0
+        return self.ext_weight > 0 or self.semantic_weight > 0 or self.cross_factor_weight > 0 or self.flow_weight > 0
 
     def forward(self, z: torch.Tensor, metadata: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         total = torch.tensor(0.0, device=z.device)
@@ -421,6 +978,14 @@ class V17ConstraintModule(nn.Module):
             ext_loss, ext_logs = self.external(z, metadata)
             total = total + self.ext_weight * ext_loss
             logs.update(ext_logs)
+        if self.semantic_weight > 0:
+            sem_loss, sem_logs = self.semantic(z, metadata)
+            total = total + self.semantic_weight * sem_loss
+            logs.update(sem_logs)
+        if self.cross_factor_weight > 0:
+            cross_loss, cross_logs = self.cross_factor(z, metadata)
+            total = total + self.cross_factor_weight * cross_loss
+            logs.update(cross_logs)
         if self.flow_weight > 0:
             cond = self.external.condition_vector(metadata, b, z.device)
             flow_loss, flow_logs = self.flow(z, cond)
