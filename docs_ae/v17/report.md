@@ -1165,6 +1165,195 @@ keep flow target detached for diagnostics, then run a deliberate joint-gradient 
 report adapter readout and flow metrics separately
 ```
 
+### Crossed Data Smoke
+
+Date: 2026-05-04
+
+The single-speaker seed corpus was not enough to test the V17 claim. A crossed CosyVoice3 corpus was added so the same text appears under multiple prompt voices and speed/style conditions:
+
+```text
+24 texts x 2 prompt voices x 2 speed/style conditions = 96 utterances
+total audio: 543.84 s = 9.06 min
+train / val: 84 / 12
+train text ids / val text ids: 21 / 3
+speaker balance: spk_zero_shot=48, spk_cross_lingual=48
+style balance: neutral_normal=48, neutral_fast=48
+```
+
+The split is by held-out `text_id`, so all speaker/style variants of a text stay in the same split.
+
+Important correction:
+
+- `asset/cross_lingual_prompt.wav` initially used the zero-shot prompt text by mistake.
+- That produced bad smoke samples of only `1.4s` and `0.4s`.
+- FunASR recovered the correct prompt text; after correction the same smoke generated normal `6.36s` and `5.06s` samples.
+
+New files:
+
+```text
+tools/tts/make_cosyvoice3_crossed_texts.py
+tools/tts/split_manifest_by_field.py
+autoencoder/conf/experiment/v17_constraints_crossed_smoke.yaml
+```
+
+Remote artifacts:
+
+```text
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl
+```
+
+Local copied metadata:
+
+```text
+outputs/tts/cosyvoice3/crossed_zh_v0/
+outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl
+```
+
+V17 crossed smoke command:
+
+```bash
+cd /root/autodl-tmp/project
+/root/miniconda3/bin/python -m autoencoder.train \
+  experiment=v17_constraints_crossed_smoke \
+  runtime=remote \
+  experiment.train.output_dir=outputs/models/v17_constraints_crossed_smoke_test \
+  experiment.train.log_interval=10 \
+  experiment.train.eval_batches=1
+```
+
+Result:
+
+```text
+Train samples: 84, Eval samples: 12
+V17 constraints params: 1,497,057
+step 80 | G=3.2181 | v17=0.3837 ext=7.4694 flow=1.0266
+Epoch 0/1 | avg_G=3.2213
+Eval: SNR=-0.21dB | STFT=3.1216 | KL=0.000000
+```
+
+Interpretation:
+
+- The V17 path can now train with non-trivial speaker/style heads instead of bias-only single-speaker labels.
+- This remains a functionality and data-shape smoke, not evidence of disentanglement.
+- The next real test needs more prompt voices and objective readout metrics, but the corpus shape is now correct.
+
+### Long10 Complete-Sentence Expansion
+
+Date: 2026-05-05
+
+The crossed corpus was extended with longer complete sentences because short utterances are less useful for duration/prosody constraints and can make the phoneme encoder target too local.
+
+Raw data:
+
+```text
+40 complete long texts x 2 prompt voices x 1 neutral_10s style = 80 utterances
+total audio: 787.80 s = 13.13 min
+duration min / max / mean / median: 7.00 / 13.24 / 9.85 / 9.80 s
+train / val: 70 / 10
+```
+
+Duration-QC data:
+
+```text
+filter: keep full text_id groups only when every speaker variant is 8-13 s
+kept: 70 utterances, 35 complete text groups
+rejected: 10 utterances, 5 complete text groups
+total kept audio: 692.88 s = 11.55 min
+duration min / max / mean / median: 8.36 / 12.32 / 9.90 / 9.80 s
+train / val: 64 / 6
+speaker balance: spk_zero_shot=35, spk_cross_lingual=35
+```
+
+New files:
+
+```text
+tools/tts/filter_manifest_by_duration.py
+autoencoder/conf/experiment/v17_constraints_long10_qc_smoke.yaml
+```
+
+Updated file:
+
+```text
+tools/tts/make_cosyvoice3_crossed_texts.py
+```
+
+V17 long10 QC smoke result:
+
+```text
+Train samples: 64, Eval samples: 6
+step 60 | G=3.7784 | v17=0.3656 ext=7.1104 flow=1.0110
+Epoch 0/1 | avg_G=3.1264
+Eval: SNR=-0.79dB | STFT=3.1674 | KL=0.000000
+```
+
+Interpretation:
+
+- The usable training manifest now contains only complete paired utterances near 10 seconds.
+- Some raw text groups remain too speaker-dependent in duration, so the next expansion should use either per-speaker speed calibration or replacement candidates.
+- Style/speed variables are intentionally not expanded in this pass; length stability came first.
+
+### Long10x v2 Larger Complete-Sentence Expansion
+
+Date: 2026-05-05
+
+The long complete-sentence crossed corpus was scaled up with a larger text bank before adding extra style or speed variables.
+
+Raw data:
+
+```text
+156 complete long texts x 2 prompt voices x 1 neutral_10s style = 312 utterances
+total audio: 3769.56 s = 62.83 min
+duration min / max / mean / median: 8.12 / 18.08 / 12.08 / 12.16 s
+train / val: 280 / 32
+RTF excluding load: 0.4929
+RTF including load: 0.4972
+```
+
+QC data:
+
+```text
+text QC: rejected 2 utterances, 1 complete text group
+duration QC: keep full text_id groups only when every speaker variant is 8-13 s
+kept: 170 utterances, 85 complete text groups
+rejected by duration: 140 utterances, 70 complete text groups
+total kept audio: 1891.28 s = 31.52 min
+duration min / max / mean / median: 8.12 / 13.00 / 11.13 / 11.32 s
+train / val: 148 / 22
+speaker balance: spk_zero_shot=85, spk_cross_lingual=85
+domain counts: daily=48, questions=34, wiki=34, numbers=28, hard=26
+```
+
+New files:
+
+```text
+tools/tts/filter_manifest_by_text_quality.py
+autoencoder/conf/experiment/v17_constraints_long10x_qc_smoke.yaml
+outputs/tts/cosyvoice3/crossed_zh_long10x_v2_texts.jsonl
+outputs/tts/cosyvoice3/crossed_zh_long10x_v2/
+```
+
+Updated file:
+
+```text
+tools/tts/make_cosyvoice3_crossed_texts.py
+```
+
+V17 long10x QC smoke result:
+
+```text
+Train samples: 148, Eval samples: 22
+step 140 | G=2.4016 | v17=0.3391 ext=6.5813 flow=1.0041
+Epoch 0/1 | avg_G=3.0312
+Eval: SNR=0.17dB | STFT=2.9727 | KL=0.000000
+```
+
+Interpretation:
+
+- Long10x v2 increases usable QC audio from 11.55 min to 31.52 min while keeping complete paired text groups.
+- The main limitation is duration retention for the slower prompt voice, not synthesis throughput.
+- Before moving to 16 voices, add per-speaker speed calibration or generate shorter candidate text for slow voices.
+
 ## What Should Not Be Merged Into V17 Core Yet
 
 The following ideas should remain separate until validated:
@@ -1207,14 +1396,13 @@ This preserves the key requirements:
 
 ## Immediate Next Step
 
-Build the two-constraint V17 smoke path:
+Move from crossed smoke to a measurable V17 run:
 
-1. Generate or collect controlled paired audio from CosyVoice3.
-2. Encode all audio with the AE.
-3. Add external modality encoder-adapter losses on `z`.
-4. Add a small flow/generative loss on `z`.
-5. Compare against reconstruction-only AE and post-hoc DiT.
-6. Report:
+1. Expand the prompt voice catalog beyond the current two valid prompt wavs.
+2. Add teacher/frontend or forced-alignment pinyin durations.
+3. Run a longer crossed V17 diagnostic with speaker/style/speed heads enabled.
+4. Compare against reconstruction-only AE and post-hoc DiT.
+5. Report:
    - reconstruction quality
    - adapter readout scores
    - adapter leakage/shortcut checks

@@ -153,3 +153,345 @@ Caveats:
 - CosyVoice3 warns that many synthesis texts are shorter than the prompt text. This is acceptable for this seed pass, but the next prompt set should use shorter prompt text or longer utterances.
 - `pypinyin` was installed in the project Python env and used to create pinyin/tone metadata.
 - Current `pinyin_durations` are punctuation/speed heuristic labels, not teacher-native durations. Replace them with frontend/teacher/forced-alignment durations when available.
+
+## Crossed Chinese Corpus V0
+
+Date: 2026-05-04
+
+Why this exists:
+
+- A single-speaker corpus does not test the V17 goal.
+- V17 needs the same text under multiple external conditions so the latent can be pressured to separate text, speaker, and style/speed factors.
+- This crossed corpus is the first useful data shape for the external modality encoder-adapter and flow constraints.
+
+Local code:
+
+- `tools/tts/make_cosyvoice3_crossed_texts.py`
+- `tools/tts/split_manifest_by_field.py`
+- `tools/tts/add_pinyin_duration_labels.py`
+- `tools/tts/cosyvoice3_batch_synth.py`
+
+Design:
+
+```text
+24 text prompts x 2 prompt voices x 2 speed/style conditions = 96 utterances
+```
+
+Current prompt voices:
+
+```text
+spk_zero_shot:
+  wav: asset/zero_shot_prompt.wav
+  text: You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。
+
+spk_cross_lingual:
+  wav: asset/cross_lingual_prompt.wav
+  text: You are a helpful assistant.<|endofprompt|>在那之后完全收购那家公司，因此保持管理层的一致性，利益与即将加入家族的资产保持一致，这就是我们有时不买下全部的原因。
+```
+
+The `spk_cross_lingual` prompt text was recovered with FunASR. Using the zero-shot prompt text for this wav produced bad smoke samples of only `1.4s` and `0.4s`; after correction the same crossed smoke generated `6.36s` and `5.06s`.
+
+Remote run:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --out outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl \
+  --max-texts 24
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_v0 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl \
+  --fp16
+
+/root/miniconda3/bin/python scripts/split_manifest_by_field.py \
+  --in-jsonl outputs/tts/cosyvoice3/crossed_zh_v0/manifest.jsonl \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_v0 \
+  --field split \
+  --prefix manifest
+
+/root/miniconda3/bin/python scripts/add_pinyin_duration_labels.py \
+  --in-jsonl outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train.jsonl \
+  --out-jsonl outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train_pinyin.jsonl
+
+/root/miniconda3/bin/python scripts/add_pinyin_duration_labels.py \
+  --in-jsonl outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val.jsonl \
+  --out-jsonl outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val_pinyin.jsonl
+```
+
+Artifacts:
+
+```text
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/wav/
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/manifest.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train_pinyin.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val_pinyin.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_v0/summary.json
+```
+
+Local copied metadata:
+
+```text
+outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/manifest.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/manifest_train_pinyin.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val_pinyin.jsonl
+outputs/tts/cosyvoice3/crossed_zh_v0/summary.json
+```
+
+Summary:
+
+```text
+items: 96
+sample rate: 24000 Hz
+total audio: 543.84 s = 9.06 min
+train / val: 84 / 12
+train text ids / val text ids: 21 / 3
+speaker balance: spk_zero_shot=48, spk_cross_lingual=48
+style balance: neutral_normal=48, neutral_fast=48
+spk_zero_shot duration: 246.44 s, min=3.00 s, max=7.20 s
+spk_cross_lingual duration: 297.40 s, min=4.00 s, max=8.84 s
+RTF excluding load: 0.6843
+RTF including load: 0.7173
+GPU: NVIDIA GeForce RTX 5090
+```
+
+V17 crossed smoke:
+
+```bash
+cd /root/autodl-tmp/project
+/root/miniconda3/bin/python -m autoencoder.train \
+  experiment=v17_constraints_crossed_smoke \
+  runtime=remote \
+  experiment.train.output_dir=outputs/models/v17_constraints_crossed_smoke_test \
+  experiment.train.log_interval=10 \
+  experiment.train.eval_batches=1
+```
+
+Result:
+
+```text
+Train samples: 84, Eval samples: 12
+V17 constraints params: 1,497,057
+step 80 | G=3.2181 | v17=0.3837 ext=7.4694 flow=1.0266
+Epoch 0/1 | avg_G=3.2213
+Eval: SNR=-0.21dB | STFT=3.1216 | KL=0.000000
+```
+
+Notes:
+
+- The train/val split is by held-out `text_id`; all speaker/style variants of a text stay in the same split.
+- Current corpus is only a 2-speaker smoke because only two prompt wavs are present locally, and one required ASR recovery. The manifest generator accepts a speaker catalog and is meant to scale to 4/8/16 prompt voices.
+- This is still not enough to prove disentanglement. It only proves the data and V17 training path can express the right factorization pressure.
+
+## Crossed Long10 Chinese Corpus V1
+
+Date: 2026-05-05
+
+Goal:
+
+- Use complete Chinese sentences.
+- Target each utterance near 10 seconds.
+- Keep the crossed text/speaker structure, but avoid speed/style variables until length is calibrated.
+
+Design:
+
+```text
+40 complete long texts x 2 prompt voices x 1 neutral_10s style = 80 raw utterances
+```
+
+Local code:
+
+- `tools/tts/make_cosyvoice3_crossed_texts.py --text-set long10`
+- `tools/tts/filter_manifest_by_duration.py`
+- `tools/tts/split_manifest_by_field.py`
+- `tools/tts/add_pinyin_duration_labels.py`
+
+Remote run:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --text-set long10 \
+  --version crosszh_long10_v1 \
+  --max-texts 40 \
+  --val-every 8 \
+  --out outputs/tts/cosyvoice3/crossed_zh_long10_v1_texts.jsonl
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_long10_v1 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_long10_v1_texts.jsonl \
+  --fp16
+```
+
+Raw summary:
+
+```text
+items: 80
+texts: 40
+speakers: 2
+style: neutral_10s
+total audio: 787.80 s = 13.13 min
+duration min / max / mean / median: 7.00 / 13.24 / 9.85 / 9.80 s
+train / val: 70 / 10
+RTF excluding load: 0.5458
+RTF including load: 0.5697
+```
+
+Duration QC:
+
+```bash
+/root/miniconda3/bin/python scripts/filter_manifest_by_duration.py \
+  --in-jsonl outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest.jsonl \
+  --out-jsonl outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13.jsonl \
+  --reject-jsonl outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_reject_8_13.jsonl \
+  --min-seconds 8 \
+  --max-seconds 13 \
+  --group-field text_id
+```
+
+QC summary:
+
+```text
+kept: 70 utterances, 35 complete text groups
+rejected: 10 utterances, 5 complete text groups
+total kept audio: 692.88 s = 11.55 min
+duration min / max / mean / median: 8.36 / 12.32 / 9.90 / 9.80 s
+train / val: 64 / 6
+speaker balance: spk_zero_shot=35, spk_cross_lingual=35
+```
+
+QC artifacts:
+
+```text
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_train.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_val.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_train_pinyin.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_val_pinyin.jsonl
+```
+
+Local copied metadata:
+
+```text
+outputs/tts/cosyvoice3/crossed_zh_long10_v1_texts.jsonl
+outputs/tts/cosyvoice3/crossed_zh_long10_v1/
+```
+
+V17 long10 QC smoke:
+
+```bash
+cd /root/autodl-tmp/project
+/root/miniconda3/bin/python -m autoencoder.train \
+  experiment=v17_constraints_long10_qc_smoke \
+  runtime=remote \
+  experiment.train.output_dir=outputs/models/v17_constraints_long10_qc_smoke_test \
+  experiment.train.log_interval=10 \
+  experiment.train.eval_batches=1
+```
+
+Result:
+
+```text
+Train samples: 64, Eval samples: 6
+step 60 | G=3.7784 | v17=0.3656 ext=7.1104 flow=1.0110
+Epoch 0/1 | avg_G=3.1264
+Eval: SNR=-0.79dB | STFT=3.1674 | KL=0.000000
+```
+
+Notes:
+
+- The raw set is retained, but use the QC manifests for V17 training if the requirement is near-10-second complete utterances.
+- QC filtering drops full `text_id` groups, so speaker balance and crossed pairing remain intact.
+- The rejected groups are useful feedback for the next text generator pass: some texts are speaker-dependent in duration and need per-speaker speed calibration or replacement.
+
+### Long10x v2 Larger Complete-Sentence Set
+
+Purpose:
+
+- Scale the long complete-sentence crossed set while preserving paired `text_id` groups.
+- Keep only one neutral style for now; expand text/time before adding more variables.
+- Add a text-quality QC pass before duration QC.
+
+Design:
+
+```text
+156 complete long texts x 2 prompt voices x 1 neutral_10s style = 312 raw utterances
+```
+
+Generation:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --text-set long10x \
+  --version crosszh_long10x_v2 \
+  --max-texts 160 \
+  --min-chars 40 \
+  --max-chars 62 \
+  --val-every 10 \
+  --out outputs/tts/cosyvoice3/crossed_zh_long10x_v2_texts.jsonl
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_long10x_v2 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_long10x_v2_texts.jsonl \
+  --fp16
+```
+
+Raw summary:
+
+```text
+items: 312
+texts: 156
+speakers: 2
+total audio: 3769.56 s = 62.83 min
+duration min / max / mean / median: 8.12 / 18.08 / 12.08 / 12.16 s
+train / val: 280 / 32
+RTF excluding load: 0.4929
+RTF including load: 0.4972
+```
+
+Text and duration QC:
+
+```text
+text QC rejects: 2 utterances, 1 complete text group
+duration QC filter: keep full text_id groups only when every speaker variant is 8-13 s
+kept: 170 utterances, 85 complete text groups
+rejected by duration: 140 utterances, 70 complete text groups
+total kept audio: 1891.28 s = 31.52 min
+duration min / max / mean / median: 8.12 / 13.00 / 11.13 / 11.32 s
+train / val: 148 / 22
+speaker balance: spk_zero_shot=85, spk_cross_lingual=85
+domain counts: daily=48, questions=34, wiki=34, numbers=28, hard=26
+```
+
+QC artifacts:
+
+```text
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10x_v2/manifest_qc_8_13.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10x_v2/manifest_qc_8_13_train_pinyin.jsonl
+/root/autodl-tmp/project/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10x_v2/manifest_qc_8_13_val_pinyin.jsonl
+```
+
+V17 long10x QC smoke:
+
+```text
+config: autoencoder/conf/experiment/v17_constraints_long10x_qc_smoke.yaml
+Train samples: 148, Eval samples: 22
+step 140 | G=2.4016 | v17=0.3391 ext=6.5813 flow=1.0041
+Epoch 0/1 | avg_G=3.0312
+Eval: SNR=0.17dB | STFT=2.9727 | KL=0.000000
+```
+
+Notes:
+
+- Long10x v2 gives about 2.7x the QC audio of long10 v1 while preserving complete paired text groups.
+- The main bottleneck is not synthesis speed; it is duration retention for the slower prompt voice.
+- Next expansion should calibrate per-speaker speed or use shorter text candidates for slow voices before adding 16 speakers.

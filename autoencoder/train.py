@@ -126,7 +126,7 @@ class AudioDataset(Dataset):
         lengths = []
         for p in self.audio_paths:
             try:
-                info = sf.info(p)
+                info = sf.info(self._resolve_path(p))
                 T = int(info.frames)
                 T_aligned = (T // self.total_stride) * self.total_stride
                 lengths.append(max(T_aligned, self.total_stride))
@@ -351,6 +351,58 @@ def safe_save(obj: dict, path: Path) -> None:
     tmp_path = path.with_suffix(".tmp")
     torch.save(obj, tmp_path)
     tmp_path.rename(path)
+
+
+def _metadata_audio_length(metadata: dict | None, sr: int, fallback: int) -> int:
+    if not metadata:
+        return fallback
+    if "audio_seconds" in metadata:
+        try:
+            return max(1, min(fallback, int(round(float(metadata["audio_seconds"]) * sr))))
+        except Exception:
+            return fallback
+    return fallback
+
+
+def sample_reconstruction_windows(
+    audio: torch.Tensor,
+    x_hat: torch.Tensor,
+    metadata: list[dict] | None,
+    sr: int,
+    total_stride: int,
+    window_samples: int,
+    windows_per_sample: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample fixed-size reconstruction windows from full-length batches."""
+    if window_samples <= 0 or windows_per_sample <= 0:
+        return audio, x_hat
+
+    window_samples = max(total_stride, (window_samples // total_stride) * total_stride)
+    bsz, _, total_len = audio.shape
+    audio_windows = []
+    recon_windows = []
+    for b in range(bsz):
+        item_meta = metadata[b] if metadata is not None and b < len(metadata) else None
+        valid_len = _metadata_audio_length(item_meta, sr, total_len)
+        valid_len = max(total_stride, min(valid_len, total_len))
+        max_start = max(valid_len - window_samples, 0)
+        max_start = (max_start // total_stride) * total_stride
+        for _ in range(windows_per_sample):
+            if max_start > 0:
+                start = int(torch.randint(0, max_start // total_stride + 1, (1,), device=audio.device).item())
+                start *= total_stride
+            else:
+                start = 0
+            end = start + window_samples
+            a = audio[b : b + 1, :, start:min(end, total_len)]
+            r = x_hat[b : b + 1, :, start:min(end, total_len)]
+            if a.shape[-1] < window_samples:
+                pad = window_samples - a.shape[-1]
+                a = F.pad(a, (0, pad))
+                r = F.pad(r, (0, pad))
+            audio_windows.append(a)
+            recon_windows.append(r)
+    return torch.cat(audio_windows, dim=0), torch.cat(recon_windows, dim=0)
 
 
 def apply_freeze_policy(model: WavVAE, args: DictConfig) -> None:
@@ -853,6 +905,12 @@ def train(args: DictConfig) -> None:
     mel_weight = float(args.mel_weight)
     adv_g_weight = float(args.adv_g_weight)
     adv_fm_weight = float(args.adv_fm_weight)
+    recon_window_seconds = float(args.get("recon_window_seconds", 0.0))
+    recon_windows_per_sample = int(args.get("recon_windows_per_sample", 1))
+    recon_window_samples = 0
+    if recon_window_seconds > 0:
+        recon_window_samples = int(round(recon_window_seconds * sr))
+        recon_window_samples = max(total_stride, (recon_window_samples // total_stride) * total_stride)
 
     nan_streak = 0
     max_nan_streak = 20
@@ -863,6 +921,11 @@ def train(args: DictConfig) -> None:
         print(f"  Discriminator warmup: {disc_warmup_epochs} epochs (AE frozen)")
     print(f"  grad_accum={grad_accum_steps}, grad_clip={grad_clip}")
     print(f"  Loss weights: l1={l1_weight}, stft={stft_weight}, mel={mel_weight}")
+    if recon_window_samples > 0:
+        print(
+            f"  Reconstruction window loss: {recon_window_samples} samples "
+            f"({recon_window_samples / sr:.2f}s), windows_per_sample={recon_windows_per_sample}"
+        )
     if adv_enable:
         print(f"  Adv weights: g={adv_g_weight}, fm={adv_fm_weight}")
     print()
@@ -935,9 +998,21 @@ def train(args: DictConfig) -> None:
                     out = model(audio)
                 x_hat = out["x_hat"]
                 reg_loss = out["reg_loss"]
+                recon_audio = audio
+                recon_x_hat = x_hat
+                if recon_window_samples > 0:
+                    recon_audio, recon_x_hat = sample_reconstruction_windows(
+                        audio,
+                        x_hat,
+                        metadata if isinstance(metadata, list) else None,
+                        sr,
+                        total_stride,
+                        recon_window_samples,
+                        recon_windows_per_sample,
+                    )
 
                 recon_losses = compute_reconstruction_loss(
-                    audio, x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
+                    recon_audio, recon_x_hat, mrstft_loss_fn, mel_loss_fn, reg_loss,
                     l1_weight=l1_weight, l2_weight=l2_weight,
                     stft_weight=stft_weight, mel_weight=mel_weight,
                     multiband_stft_loss_fn=mb_stft_loss_fn,

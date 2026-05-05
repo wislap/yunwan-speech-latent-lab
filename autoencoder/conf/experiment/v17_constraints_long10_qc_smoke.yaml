@@ -1,0 +1,87 @@
+# V17 long10 QC smoke: crossed prompt voices with complete ~10s utterances.
+#
+# Uses the duration-QC manifest where full text_id groups are kept only if every
+# speaker variant is between 8 and 13 seconds.
+
+version_tag: v17_constraints_long10_qc_smoke
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17_constraints_long10_qc_smoke
+  data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_train_pinyin.jsonl
+  eval_data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_long10_v1/manifest_qc_8_13_val_pinyin.jsonl
+
+  latent_dim: 384
+  strides: [2, 4, 4, 8]
+  encoder_channels: [128, 256, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+
+  sample_latent: false
+  reg_weight: 1.0e-4
+  margin_mean: 6.0
+  std_min: 0.05
+  std_max: 3.0
+  reg_warmup_steps: 100
+
+  l1_time_weight: 10.0
+  l2_time_weight: 0.0
+  stft_weight: 0.5
+  mel_weight: 0.1
+  mb_stft_enable: false
+  mb_stft_weight: 1.0
+
+  v17_constraints_enable: true
+  v17_ext_weight: 0.05
+  v17_flow_weight: 0.01
+  v17_adapter_hidden_dim: 256
+  v17_text_buckets: 512
+  v17_speaker_buckets: 64
+  v17_style_buckets: 32
+  v17_ext_text_weight: 1.0
+  v17_ext_speaker_weight: 0.25
+  v17_ext_style_weight: 0.0
+  v17_ext_speed_weight: 0.1
+  v17_flow_hidden_dim: 256
+  v17_flow_depth: 2
+  v17_external_detach_latent: false
+  v17_flow_detach_target: true
+  v17_flow_min_t: 0.0
+  v17_flow_max_t: 1.0
+
+  batch_size: 1
+  grad_accum_steps: 4
+  lr: 1.0e-4
+  lr_warmup_steps: 10
+  scheduler: cosine
+  grad_clip: 1.0
+  segment_length: 32768
+  epochs: 1
+  sr: 24000
+  augment: false
+
+  adv_enable: false
+  adv_start_epoch: 999
+  adv_d_lr: 0
+  adv_g_weight: 0
+  adv_fm_weight: 0
+  freeze_encoder: false
+  freeze_decoder_blocks: false
+
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  eval_every_epochs: 1
+  eval_batches: 2
+  log_interval: 10
+  num_workers: 0
+  prefetch_factor: 2
