@@ -351,7 +351,169 @@ underpowered.
 
 ## Recommended Next Experiments
 
-### 1. Frozen Head Probe
+### 1. Frozen External-Teacher Probe
+
+Implemented entry points:
+
+```text
+autoencoder/scripts/v17_teacher_probe.py
+scripts/run_v17_teacher_probe.sh
+```
+
+This probe freezes:
+
+- V16.3 WavVAE;
+- pretrained speech teacher;
+
+and trains only:
+
+- `z_v16.3 -> sequence adapter -> teacher feature`.
+
+Initial HuBERT_BASE results:
+
+```text
+run:
+/root/autodl-tmp/project/outputs/models/v17_teacher_probe_hubert_100
+
+100 steps, 5 s crops, hidden=256, depth=2, batch=1
+
+eval_loss = 0.731
+student retrieval top1 = 0.047
+teacher retrieval top1 = 0.172
+student same-text cross-speaker cos = 0.991
+student diff-text same-speaker cos = 0.998
+student rank95 = 4
+teacher rank95 = 37
+```
+
+With batch pairwise distillation and variance guard:
+
+```text
+run:
+/root/autodl-tmp/project/outputs/models/v17_teacher_probe_hubert_pair100
+
+100 steps, 5 s crops, hidden=256, depth=2, batch=4
+
+eval_loss = 0.703
+student retrieval top1 = 0.031
+teacher retrieval top1 = 0.172
+student same-text cross-speaker cos = 0.944
+student diff-text same-speaker cos = 0.996
+student rank95 = 2
+teacher rank95 = 37
+```
+
+Interpretation:
+
+- The adapter can quickly learn per-sample teacher similarity: pooled cosine
+  reaches about 0.9.
+- But simple teacher regression still collapses global student geometry.
+- HuBERT_BASE itself is only a weak text-retrieval teacher on this Chinese TTS
+  alignment set, with top1 about 0.17.
+- Therefore this teacher/probe is useful as a plumbing check, but not yet a
+  clean content target.
+
+The attempted multilingual `WAV2VEC2_XLSR_300M` download was too slow on the
+server during this run and was cancelled before training. It remains the better
+candidate teacher if the checkpoint can be pre-fetched or mirrored.
+
+Decision:
+
+```text
+Do not use HuBERT_BASE teacher regression as the next V17 backbone loss.
+First obtain a stronger multilingual/ASR/phoneme teacher, or add a teacher-side
+projection trained for same-text cross-speaker retrieval.
+```
+
+### 2. V17.3 From-Scratch Content Teacher
+
+Implemented entry points:
+
+```text
+autoencoder/scripts/v17_3_train_content_teacher.py
+scripts/run_v17_3_content_teacher.sh
+```
+
+This branch does not modify AE. It trains a standalone raw-audio content
+teacher from scratch:
+
+```text
+audio -> strided conv frontend -> TCN blocks -> attentive pool -> content emb
+```
+
+Training objectives:
+
+- supervised contrastive over `same_text_group`;
+- same-speaker/different-text hard negative;
+- VICReg-style rank guard;
+- optional pinyin-bag multilabel prediction from the content embedding.
+
+Early runs:
+
+```text
+v17_3_content_teacher_smoke:
+  30 steps, weak rank guard
+  collapsed: pair cos ~= 1, rank95 = 3
+
+v17_3_content_teacher_rank500:
+  stronger VICReg/rank guard, 500 steps
+  rank95 = 21
+  top1_var = 0.162
+  retrieval top1 = 0.031
+  same_text_diff_speaker cos = 0.769
+  diff_text_same_speaker cos = 0.765
+
+v17_3_content_teacher_text500:
+  pinyin-bag auxiliary from pooled hidden, 500 steps
+  rank95 = 22
+  retrieval top1 = 0.000
+  same_text_diff_speaker cos = 0.769
+  diff_text_same_speaker cos = 0.795
+
+v17_3_content_teacher_embedtext1000:
+  pinyin-bag auxiliary from content projection, 1000 steps
+  rank95 = 24
+  top1_var = 0.149
+  retrieval top1 = 0.031
+  same_text_diff_speaker cos = 0.761
+  diff_text_same_speaker cos = 0.747
+  speaker centroid acc = 0.563
+
+v17_3_content_teacher_ctc001_500:
+  weak CTC auxiliary, 500 steps
+  rank95 = 21
+  top1_var = 0.159
+  retrieval top1 = 0.063
+  same_text_diff_speaker cos = 0.758
+  diff_text_same_speaker cos = 0.774
+
+v17_3_content_teacher_frame500:
+  dense frame-level pinyin CE, 500 steps
+  rank95 = 22
+  top1_var = 0.130
+  retrieval top1 = 0.047
+  same_text_diff_speaker cos = 0.746
+  diff_text_same_speaker cos = 0.748
+```
+
+Interpretation:
+
+- The from-scratch teacher can be made non-collapsed with strong rank guard.
+- The current utterance-level contrastive objective still does not learn robust
+  cross-speaker text retrieval.
+- Pinyin-bag auxiliary reduces speaker leakage somewhat and makes training
+  healthier, but does not yet create a strong content space.
+
+This is useful negative evidence: even a standalone teacher is not solved by
+same-text pair contrastive plus utterance pooling. Weak CTC and dense pinyin
+frame CE add real optimization signals, but in the current raw-waveform TCN
+teacher they still do not produce robust cross-speaker text retrieval. The next
+V17.3 iteration should either use a stronger mature frontend/encoder
+(log-mel/Conformer or pretrained multilingual ASR frontend) or train on a
+larger/more speaker-diverse crossed set before treating this teacher as a
+distillation target.
+
+### 3. Frozen Head Probe
 
 Freeze the V16.3 AE entirely. Train only cross-factor heads.
 
@@ -368,7 +530,7 @@ Decision:
 - If frozen heads succeed, our previous failures came from gradient conflict,
   not lack of accessible information.
 
-### 2. Frozen Sequence Probe
+### 4. Frozen Sequence Probe
 
 Freeze V16.3. Replace utterance mean with a lightweight temporal content encoder:
 
@@ -385,7 +547,7 @@ Check whether phoneme/content is present locally but lost by mean pooling.
 
 This is the most important next step.
 
-### 3. Head-Only Warmup Before Encoder Gradients
+### 5. Head-Only Warmup Before Encoder Gradients
 
 For V17.2-style training:
 
@@ -397,7 +559,7 @@ phase 3: optionally let structure gradients reach more encoder layers
 
 This avoids immediately moving the decoder's familiar latent distribution.
 
-### 4. Larger Multi-Speaker Data Only After the Probe
+### 6. Larger Multi-Speaker Data Only After the Probe
 
 The next dataset scale should be at least:
 
@@ -439,4 +601,3 @@ The queue implementation now stores pooled latent features and recomputes
 phoneme/speaker projections from the current head. This should remain the
 default for future queue-based factor constraints; projected-feature queues are
 too easy to misread in diagnostics.
-
