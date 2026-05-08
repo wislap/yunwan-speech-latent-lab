@@ -1,0 +1,26 @@
+[
+  {
+    "speaker_id": "spk_zero_shot",
+    "prompt_wav": "asset/zero_shot_prompt.wav",
+    "prompt_text": "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。",
+    "speed": 1.0
+  },
+  {
+    "speaker_id": "spk_cross_lingual",
+    "prompt_wav": "asset/cross_lingual_prompt.wav",
+    "prompt_text": "You are a helpful assistant.<|endofprompt|>在那之后完全收购那家公司，因此保持管理层的一致性，利益与即将加入家族的资产保持一致，这就是我们有时不买下全部的原因。",
+    "speed": 1.1
+  },
+  {
+    "speaker_id": "spk_candidate_03",
+    "prompt_wav": "asset/prompt_candidate_03.wav",
+    "prompt_text": "TODO: replace with the exact transcript of prompt_candidate_03.wav.",
+    "speed": 1.0
+  },
+  {
+    "speaker_id": "spk_candidate_04",
+    "prompt_wav": "asset/prompt_candidate_04.wav",
+    "prompt_text": "TODO: replace with the exact transcript of prompt_candidate_04.wav.",
+    "speed": 1.0
+  }
+]

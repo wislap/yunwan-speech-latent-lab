@@ -7,6 +7,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from typing import Any
 
 
 PROMPT_TEXT = "You are a helpful assistant.<|endofprompt|>希望你以后能够做的比我还好呦。"
@@ -250,16 +251,220 @@ def build_long10x_texts() -> dict[str, list[str]]:
     return text_bank
 
 
+def build_long10align_texts() -> list[dict[str, str]]:
+    """Build clustered long texts with controlled phoneme-neighbor structure."""
+    specs = [
+        (
+            "align_daily",
+            "meeting_records",
+            "整理会议记录",
+            ["核对负责人和截止时间", "核对负责人和完成时间", "核对负责人和交付时间", "核对整理人和截止时间", "核对记录人和截止时间"],
+            ["标出需要继续跟进的事项", "标出需要持续跟进的事项", "标出需要后续跟进的事项", "标出需要重点跟进的事项", "标出需要立刻跟进的事项"],
+            "第二天复盘时就不会遗漏关键问题",
+        ),
+        (
+            "align_daily",
+            "order_check",
+            "核对订单信息",
+            ["确认金额和收货地址", "确认金额和收件地址", "确认金额和配送地址", "确认价格和收货地址", "确认账单和收货地址"],
+            ["检查联系方式是否填写完整", "检查联系号码是否填写完整", "检查联系电话是否填写完整", "检查联系地址是否填写完整", "检查联系信息是否填写完整"],
+            "后续发货流程才能保持稳定",
+        ),
+        (
+            "align_daily",
+            "server_status",
+            "检查服务器状态",
+            ["记录显卡占用和磁盘空间", "记录显存占用和磁盘空间", "记录显卡负载和磁盘空间", "记录显卡占用和缓存空间", "记录显卡占用和剩余空间"],
+            ["保存最近一次任务日志", "保存最近一轮任务日志", "保存最新一次任务日志", "保存最近一次训练日志", "保存最近一次合成日志"],
+            "出现异常时可以迅速定位原因",
+        ),
+        (
+            "align_speech",
+            "sample_listen",
+            "试听合成样本",
+            ["标记发音和停顿问题", "标记发音和断句问题", "标记读音和停顿问题", "标记音量和停顿问题", "标记发音和节奏问题"],
+            ["记录音量变化明显的片段", "记录能量变化明显的片段", "记录响度变化明显的片段", "记录音高变化明显的片段", "记录音色变化明显的片段"],
+            "下一轮筛选就会更有依据",
+        ),
+        (
+            "align_speech",
+            "latent_probe",
+            "分析潜变量结构",
+            ["比较音素读出是否稳定", "比较声调读出是否稳定", "比较文本读出是否稳定", "比较音节读出是否稳定", "比较语义读出是否稳定"],
+            ["检查说话人信息是否泄漏", "检查声线信息是否泄漏", "检查风格信息是否泄漏", "检查速度信息是否泄漏", "检查残差信息是否泄漏"],
+            "我们才能判断约束是否真的起作用",
+        ),
+        (
+            "align_speech",
+            "long_sentence",
+            "评估十秒长句",
+            ["观察短语边界是否稳定", "观察句子边界是否稳定", "观察停顿边界是否稳定", "观察音素边界是否稳定", "观察语义边界是否稳定"],
+            ["检查停顿和语速估计是否可靠", "检查停顿和音高估计是否可靠", "检查节奏和语速估计是否可靠", "检查停顿和时长估计是否可靠", "检查重音和语速估计是否可靠"],
+            "它会比短句烟测更接近真实场景",
+        ),
+        (
+            "align_numbers",
+            "training_config",
+            "检查训练配置",
+            ["确认学习率和累积步数", "确认学习率和预热步数", "确认学习率和保存步数", "确认批大小和累积步数", "确认片段长和累积步数"],
+            ["记录批大小和片段长度", "记录批大小和窗口长度", "记录批数量和片段长度", "记录显存占用和片段长度", "记录采样频率和片段长度"],
+            "显存有限时也能保持稳定更新",
+        ),
+        (
+            "align_numbers",
+            "data_filter",
+            "筛选音频样本",
+            ["确认目标长度接近十秒", "确认目标时长接近十秒", "确认平均长度接近十秒", "确认目标长度接近九秒", "确认目标长度接近十二秒"],
+            ["剔除低于八秒或高于十三秒的文本组", "剔除短于八秒或长于十三秒的文本组", "剔除低于七秒或高于十三秒的文本组", "剔除低于八秒或高于十二秒的文本组", "剔除低于八秒或高于十四秒的文本组"],
+            "交叉配对结构可以保持完整",
+        ),
+        (
+            "align_wiki",
+            "river_region",
+            "介绍长江流域",
+            ["说明地形和气候差异", "说明地貌和气候差异", "说明地形和降水差异", "说明地形和温度差异", "说明区域和气候差异"],
+            ["补充城市分布和生态压力", "补充城市分布和环境压力", "补充城镇分布和生态压力", "补充人口分布和生态压力", "补充城市分布和治理压力"],
+            "相关治理问题可以分区讨论",
+        ),
+        (
+            "align_wiki",
+            "machine_learning",
+            "介绍机器学习",
+            ["说明样本质量的重要性", "说明标签质量的重要性", "说明数据质量的重要性", "说明样本数量的重要性", "说明样本分布的重要性"],
+            ["补充标签一致性和评估方式", "补充标注一致性和评估方式", "补充标签完整性和评估方式", "补充标签一致性和验证方式", "补充标签一致性和测试方式"],
+            "模型表现就不会只看训练损失",
+        ),
+    ]
+
+    rows: list[dict[str, str]] = []
+    for domain, cluster, scene, action_variants, detail_variants, result in specs:
+        for variant_i, (action, detail) in enumerate(zip(action_variants, detail_variants)):
+            if variant_i == 0:
+                variant_type = "anchor"
+                band = "same_cluster_anchor"
+            elif variant_i in {1, 2}:
+                variant_type = "near_substitution"
+                band = "near"
+            else:
+                variant_type = "mid_substitution"
+                band = "mid"
+            text = f"在{scene}时，我们会先{action}，再{detail}，这样{result}。"
+            rows.append(
+                {
+                    "domain": domain,
+                    "text_index": f"{cluster}_{variant_i:02d}",
+                    "text": text,
+                    "phoneme_cluster_id": cluster,
+                    "phoneme_variant_id": f"{cluster}_{variant_i:02d}",
+                    "phoneme_variant_type": variant_type,
+                    "expected_edit_distance_band": band,
+                }
+            )
+    return rows
+
+
+def build_long10scale_texts() -> list[dict[str, str]]:
+    """Build a larger broad-coverage long-text pool for multi-hour synthesis."""
+    def phrase(text: str) -> str:
+        for prefix in ("先", "再", "并且", "同时"):
+            text = text.removeprefix(prefix)
+        return text
+
+    def clean_text(text: str) -> str:
+        replacements = {
+            "先先": "先",
+            "再再": "再",
+            "并且并且": "并且",
+            "同时同时": "同时",
+            "并且再": "并且",
+            "并且先": "并且",
+        }
+        for src, dst in replacements.items():
+            text = text.replace(src, dst)
+        return text
+
+    rows: list[dict[str, str]] = []
+    for domain, texts in build_long10x_texts().items():
+        for index, text in enumerate(texts):
+            rows.append(
+                {
+                    "domain": domain,
+                    "text_index": f"base_{index:03d}",
+                    "text": text,
+                    "scale_source": "long10x_base",
+                }
+            )
+
+    specs = {
+        "scale_daily": {
+            "scenes": ["整理会议材料", "核对订单信息", "检查设备状态", "准备课堂讲义", "处理用户反馈", "安排出差计划", "复查实验记录", "更新项目清单"],
+            "actions": ["确认负责人和截止时间", "核对编号和关键备注", "记录当前状态和异常现象", "整理步骤和注意事项", "区分真实需求和偶发问题", "检查路线和住宿信息"],
+            "details": ["补充需要继续跟进的事项", "保存便于复现的版本信息", "标出风险较高的环节", "把容易遗漏的细节单独列出", "同步给相关同事再次确认", "保留下一轮讨论所需证据"],
+            "results": ["第二天复盘时就不会遗漏关键问题", "后续流程才能保持稳定", "团队讨论时会更容易达成一致", "出现异常时可以更快定位原因"],
+        },
+        "scale_speech": {
+            "scenes": ["试听合成音频", "评估长句样本", "检查声线一致性", "分析潜变量结构", "准备蒸馏数据", "筛选异常片段", "比较重建结果", "记录语音指标"],
+            "actions": ["标记发音和停顿问题", "观察短语边界是否稳定", "比较同文本下的声线差异", "检查音素读出是否可靠", "确认文本和音频是否一致", "统计音量和能量分布"],
+            "details": ["记录变化明显的片段", "补充语速和停顿估计", "排除突然截断的样本", "保留跨说话人的完整配对", "加入近邻文本用于对齐", "检查说话人信息是否泄漏"],
+            "results": ["下一轮训练会更容易判断问题来源", "外部约束才能获得更清楚的梯度", "模型结构是否有效会更容易验证", "数据扩展时不必完全依赖人工试听"],
+        },
+        "scale_wiki": {
+            "scenes": ["介绍长江流域", "介绍太阳系结构", "介绍印刷术传播", "介绍城市交通", "介绍显微镜作用", "介绍海洋系统", "介绍机器学习", "介绍古代贸易路线"],
+            "actions": ["说明背景和主要组成", "比较不同区域的差异", "梳理长期变化的过程", "解释关键概念的含义", "补充常见例子和证据", "区分主要因素和次要因素"],
+            "details": ["强调数据和观察的重要性", "说明人类活动带来的影响", "补充历史材料中的线索", "把复杂关系拆成几个层次", "联系现实场景中的应用", "避免只依赖单一指标判断"],
+            "results": ["听者能够形成更完整的理解", "相关问题可以根据场景分别讨论", "后续解释会显得更加清楚", "模型也能覆盖更稳定的知识类文本"],
+        },
+        "scale_numbers": {
+            "scenes": ["核对发票记录", "统计数据规模", "检查训练配置", "记录服务器任务", "整理评估清单", "规划声线目录", "估算生成成本", "筛选音频样本"],
+            "actions": ["确认编号和付款金额", "计算样本数量和总时长", "记录学习率和批大小", "写下开始时间和结束时间", "区分重建质量和语义读出", "估算扩展后的样本数量"],
+            "details": ["补充账户尾号和报销类别", "比较过滤前后的保留比例", "检查显存占用和累积步数", "统计平均实时率和失败次数", "加入采样稳定性的检查项", "保留每个声线的质量备注"],
+            "results": ["后续报告可以引用准确路径", "下一批数据成本就能提前估算", "显存有限时也能保持稳定更新", "实验之间会更容易公平比较"],
+        },
+        "scale_hard": {
+            "scenes": ["处理中英文混合文本", "处理括号补充说明", "处理复杂变量设计", "处理自动转写结果", "处理流匹配训练", "处理真实数据和合成数据", "处理局部线性约束", "处理跨样本对齐"],
+            "actions": ["控制困难片段的长度和位置", "避免补充内容读得过重", "先固定文本长度和声线条件", "复核可能出现的错字和缺失标点", "观察采样方差是否收缩", "比较自然度和标注成本"],
+            "details": ["检查局部节奏是否突然变化", "确认整句话的重点没有偏移", "再逐步加入速度和环境变量", "保留干净标签和可控变量", "检查条件是否足以预测潜变量方向", "加入近邻和远邻的匹配关系"],
+            "results": ["失败时才容易定位真正原因", "训练样本会更接近自然口语", "新表示才不会只服务于重建", "后续训练可以形成互补关系"],
+        },
+    }
+    templates = [
+        "在{scene}时，我们会先{action}，再{detail}，这样{result}。",
+        "为了更稳定地{scene}，需要先{action}，并且{detail}，这样{result}。",
+    ]
+    for domain, spec in specs.items():
+        item_index = 0
+        for scene in spec["scenes"]:
+            for action_i, action in enumerate(spec["actions"]):
+                for detail_i, detail in enumerate(spec["details"]):
+                    action = phrase(action)
+                    detail = phrase(detail)
+                    result = spec["results"][(action_i + detail_i) % len(spec["results"])]
+                    template = templates[(action_i + detail_i) % len(templates)]
+                    text = clean_text(template.format(scene=scene, action=action, detail=detail, result=result))
+                    rows.append(
+                        {
+                            "domain": domain,
+                            "text_index": f"scale_{item_index:04d}",
+                            "text": text,
+                            "scale_source": "long10scale_template",
+                        }
+                    )
+                    item_index += 1
+    return rows
+
+
 DEFAULT_SPEAKERS = [
     {
         "speaker_id": "spk_zero_shot",
         "prompt_wav": "asset/zero_shot_prompt.wav",
         "prompt_text": PROMPT_TEXT,
+        "speed": 1.0,
     },
     {
         "speaker_id": "spk_cross_lingual",
         "prompt_wav": "asset/cross_lingual_prompt.wav",
         "prompt_text": CROSS_LINGUAL_PROMPT_TEXT,
+        "speed": 1.0,
     },
 ]
 
@@ -279,21 +484,34 @@ def read_json(path: Path) -> object:
         return json.load(f)
 
 
-def flatten_texts(seed: int, max_texts: int, text_set: str, min_chars: int, max_chars: int) -> list[dict[str, str]]:
-    if text_set == "long10x":
+def flatten_texts(seed: int, max_texts: int, text_set: str, min_chars: int, max_chars: int) -> list[dict[str, Any]]:
+    if text_set == "long10scale":
+        rows = build_long10scale_texts()
+    elif text_set == "long10align":
+        rows = build_long10align_texts()
+    elif text_set == "long10x":
         text_bank = build_long10x_texts()
+        rows = []
+        for domain, texts in text_bank.items():
+            for index, text in enumerate(texts):
+                rows.append({"domain": domain, "text_index": str(index), "text": text})
     elif text_set == "long10":
         text_bank = LONG10_TEXTS
+        rows = []
+        for domain, texts in text_bank.items():
+            for index, text in enumerate(texts):
+                rows.append({"domain": domain, "text_index": str(index), "text": text})
     else:
         text_bank = TEXTS
-    rows = []
-    for domain, texts in text_bank.items():
-        for index, text in enumerate(texts):
-            if min_chars > 0 and len(text) < min_chars:
-                continue
-            if max_chars > 0 and len(text) > max_chars:
-                continue
-            rows.append({"domain": domain, "text_index": str(index), "text": text})
+        rows = []
+        for domain, texts in text_bank.items():
+            for index, text in enumerate(texts):
+                rows.append({"domain": domain, "text_index": str(index), "text": text})
+    rows = [
+        row for row in rows
+        if (min_chars <= 0 or len(str(row["text"])) >= min_chars)
+        and (max_chars <= 0 or len(str(row["text"])) <= max_chars)
+    ]
     rng = random.Random(seed)
     rng.shuffle(rows)
     if max_texts > 0:
@@ -306,7 +524,7 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("outputs/tts/cosyvoice3/crossed_zh_v0_texts.jsonl"))
     parser.add_argument("--speakers-json", type=Path, default=None)
     parser.add_argument("--styles-json", type=Path, default=None)
-    parser.add_argument("--text-set", choices=["short", "long10", "long10x"], default="short")
+    parser.add_argument("--text-set", choices=["short", "long10", "long10x", "long10align", "long10scale"], default="short")
     parser.add_argument("--version", default="crosszh_v0")
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--max-texts", type=int, default=24)
@@ -316,7 +534,7 @@ def main() -> None:
     args = parser.parse_args()
 
     speakers = read_json(args.speakers_json) if args.speakers_json else DEFAULT_SPEAKERS
-    default_styles = LONG10_STYLES if args.text_set in {"long10", "long10x"} else DEFAULT_STYLES
+    default_styles = LONG10_STYLES if args.text_set in {"long10", "long10x", "long10align", "long10scale"} else DEFAULT_STYLES
     styles = read_json(args.styles_json) if args.styles_json else default_styles
     if not isinstance(speakers, list) or not speakers:
         raise ValueError("speakers must be a non-empty JSON list")
@@ -332,9 +550,10 @@ def main() -> None:
             for style in styles:
                 speaker_id = str(speaker["speaker_id"])
                 style_id = str(style["style_id"])
+                speaker_speed = float(speaker.get("speed", 1.0))
+                style_speed = float(style.get("speed", 1.0))
                 utt_id = f"{args.version}_{len(rows):05d}_{speaker_id}_{style_id}"
-                rows.append(
-                    {
+                row = {
                         "id": utt_id,
                         "text": text_row["text"],
                         "language": "zh",
@@ -347,12 +566,17 @@ def main() -> None:
                         "style_id": style_id,
                         "style": style_id,
                         "condition_id": f"{speaker_id}__{style_id}",
-                        "speed": float(style.get("speed", 1.0)),
+                        "speed": speaker_speed * style_speed,
+                        "speaker_speed": speaker_speed,
+                        "style_speed": style_speed,
                         "prompt_wav": str(speaker["prompt_wav"]),
                         "prompt_text": str(speaker.get("prompt_text", PROMPT_TEXT)),
                         "split": split,
                     }
-                )
+                for key in ("phoneme_cluster_id", "phoneme_variant_id", "phoneme_variant_type", "expected_edit_distance_band", "scale_source"):
+                    if key in text_row:
+                        row[key] = text_row[key]
+                rows.append(row)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:

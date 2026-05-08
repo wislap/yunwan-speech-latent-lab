@@ -495,3 +495,236 @@ Notes:
 - Long10x v2 gives about 2.7x the QC audio of long10 v1 while preserving complete paired text groups.
 - The main bottleneck is not synthesis speed; it is duration retention for the slower prompt voice.
 - Next expansion should calibrate per-speaker speed or use shorter text candidates for slow voices before adding 16 speakers.
+
+## Long10x Alignment Audit And Long10align
+
+Current `crossed_zh_long10x_v2` is useful for clean long-utterance reconstruction and same-text cross-speaker pairing, but it is not yet the best shape for V17.1 phoneme geometry constraints.
+
+Observed after adding phoneme alignment scaffolds and neighbor indices:
+
+```text
+QC train: 148 utterances, 74 complete text groups
+QC val: 22 utterances, 11 complete text groups
+train duration/rate CV: p50=0.0565, p90=0.1091, max=0.1563
+val duration/rate CV: p50=0.0650, max=0.1020
+train hard-negative normalized edit distance mean: 0.7734
+train easy-negative normalized edit distance mean: 0.9953
+val hard-negative normalized edit distance mean: 0.9608
+val easy-negative normalized edit distance mean: 0.9794
+```
+
+Interpretation:
+
+- Same-text cross-speaker total duration consistency is good enough to start forced alignment.
+- The current pinyin spans are only heuristic scaffolds, not true phoneme boundaries.
+- The text bank is broad rather than locally clustered. Hard negatives are still far away, so contrastive phoneme constraints receive a weak local geometry signal.
+- Before scaling to many speakers, add a clustered text set where each semantic template has anchor, near-substitution, and mid-substitution variants.
+
+Added tools:
+
+```text
+tools/tts/add_phoneme_alignment_scaffold.py
+tools/tts/add_phoneme_neighbor_index.py
+tools/tts/export_forced_alignment_corpus.py
+```
+
+Added text set:
+
+```text
+tools/tts/make_cosyvoice3_crossed_texts.py --text-set long10align
+```
+
+Local generation smoke:
+
+```text
+10 phoneme clusters x 5 variants x 2 prompt voices x 1 neutral style = 100 utterances
+text groups: 50
+characters per text: min=50, max=58, mean=53.68
+variant bands: anchor=10, near=20, mid=20
+```
+
+Generation command:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --text-set long10align \
+  --version crosszh_long10align_v0 \
+  --max-texts 0 \
+  --min-chars 40 \
+  --max-chars 70 \
+  --val-every 10 \
+  --out outputs/tts/cosyvoice3/crossed_zh_long10align_v0_texts.jsonl
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_long10align_v0 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_long10align_v0_texts.jsonl \
+  --fp16
+```
+
+After synthesis, keep the same QC chain:
+
+```bash
+/root/miniconda3/bin/python scripts/filter_manifest_by_text_quality.py ...
+/root/miniconda3/bin/python scripts/filter_manifest_by_duration.py ...
+/root/miniconda3/bin/python scripts/split_manifest_by_field.py ...
+/root/miniconda3/bin/python scripts/add_pinyin_duration_labels.py ...
+/root/miniconda3/bin/python scripts/add_phoneme_alignment_scaffold.py ...
+/root/miniconda3/bin/python scripts/add_phoneme_neighbor_index.py ...
+```
+
+For V17.1, use `long10x` as broad clean coverage and `long10align` as the structured geometry set. The latter should carry more weight in phoneme contrastive/local-linearity diagnostics, while reconstruction should still see both distributions.
+
+## Four-Voice Four-Hour Target
+
+Decision:
+
+```text
+voices: 4
+target usable audio: about 4 hours
+target average utterance length: about 10 seconds
+target usable utterances: about 1440
+target usable complete text groups: about 360
+```
+
+Because earlier long10x QC kept about half of complete text groups, prepare a larger raw set:
+
+```text
+raw text groups: 550-650
+raw utterances with 4 voices: 2200-2600
+expected usable utterances after QC: about 1200-1600
+expected usable audio: about 3.3-4.4 hours
+```
+
+Recommended mix:
+
+```text
+long10scale: broad clean coverage, about 500-550 text groups
+long10align: local phoneme-geometry coverage, about 50 text groups
+stress/hard cases: included inside long10scale domains
+```
+
+Current blocker:
+
+```text
+Only 2 prompt wavs are currently present on the server:
+asset/zero_shot_prompt.wav
+asset/cross_lingual_prompt.wav
+```
+
+Before synthesizing the 4-voice set, add two more prompt wavs and exact prompt transcripts. A template is available at:
+
+```text
+tools/tts/cosyvoice3_speakers_4voice_template.json
+```
+
+The current `spk_cross_lingual` prompt is slower than `spk_zero_shot`, so the template sets:
+
+```text
+spk_zero_shot speed: 1.0
+spk_cross_lingual speed: 1.1
+```
+
+Keep this per-speaker speed calibration in the manifest, because duration QC is performed on complete text groups and a single slow speaker can reject the whole group.
+
+After filling the two candidate voices, copy it to the server and generate the broad set:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --text-set long10scale \
+  --speakers-json configs/cosyvoice3_speakers_4voice.json \
+  --version crosszh_4spk_4h_scale_v0 \
+  --max-texts 650 \
+  --min-chars 40 \
+  --max-chars 58 \
+  --val-every 20 \
+  --out outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_texts.jsonl
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_texts.jsonl \
+  --fp16
+```
+
+Then synthesize the structured alignment set with the same speaker catalog:
+
+```bash
+/root/miniconda3/bin/python scripts/make_cosyvoice3_crossed_texts.py \
+  --text-set long10align \
+  --speakers-json configs/cosyvoice3_speakers_4voice.json \
+  --version crosszh_4spk_4h_align_v0 \
+  --max-texts 0 \
+  --min-chars 40 \
+  --max-chars 70 \
+  --val-every 10 \
+  --out outputs/tts/cosyvoice3/crossed_zh_4spk_4h_align_v0_texts.jsonl
+
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/cosyvoice3_batch_synth.py \
+  --model-dir pretrained_models/Fun-CosyVoice3-0.5B \
+  --out-dir outputs/tts/cosyvoice3/crossed_zh_4spk_4h_align_v0 \
+  --texts-jsonl outputs/tts/cosyvoice3/crossed_zh_4spk_4h_align_v0_texts.jsonl \
+  --fp16
+```
+
+Use the existing QC/alignment chain after synthesis. For training, keep the manifests separate at first so `long10align` can be upweighted in phoneme-locality losses without overrepresenting repetitive template text in reconstruction.
+
+Current 2-voice bootstrap:
+
+```text
+speaker catalog: configs/cosyvoice3_speakers_2voice_calibrated.json
+broad text manifest: outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_texts_2spk_calib.jsonl
+broad output dir: outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_2spk_calib
+align text manifest: outputs/tts/cosyvoice3/crossed_zh_4spk_4h_align_v0_texts_2spk_calib.jsonl
+align output dir: outputs/tts/cosyvoice3/crossed_zh_4spk_4h_align_v0_2spk_calib
+```
+
+The calibrated 8-utterance smoke used `max_chars=58` and `spk_cross_lingual speed=1.1`; all eight samples landed in the 10.06-12.84 s range.
+
+## AISHELL-3 Backup Prompt Voices
+
+AISHELL-3 is the preferred public Mandarin source for expanding prompt voices because it is multi-speaker, TTS-oriented, professionally transcribed, and released under Apache-2.0 on OpenSLR/HuggingFace.
+
+Current backup selection:
+
+```text
+source: AISHELL-3
+selected prompt voices: 32
+gender: male=12, female=20
+accent: south=12, north=20
+prompt duration: min=10.555 s, max=15.480 s, mean=12.524 s
+```
+
+Artifacts on server:
+
+```text
+/root/autodl-tmp/project_data/aishell3_prompt_candidates_32/
+/root/autodl-tmp/project_data/aishell3_prompt_candidates_32/selected_prompts.json
+/root/autodl-tmp/project_data/aishell3_prompt_candidates_32/cosyvoice3_speakers_aishell3_32backup.json
+/root/autodl-tmp/project/CosyVoice_main/asset/aishell3_prompts/
+/root/autodl-tmp/project/CosyVoice_main/configs/cosyvoice3_speakers_aishell3_32backup.json
+/root/autodl-tmp/project/CosyVoice_main/configs/aishell3_selected_prompts_32backup.json
+```
+
+Immediate 4-voice trial catalog:
+
+```text
+/root/autodl-tmp/project/CosyVoice_main/configs/cosyvoice3_speakers_4voice_with_aishell3.json
+
+speakers:
+spk_zero_shot
+spk_cross_lingual
+aishell3_SSB0631
+aishell3_SSB0426
+```
+
+Selection script:
+
+```text
+tools/tts/select_aishell3_prompt_speakers.py
+```
+
+The script downloads only the needed AISHELL-3 files from the HuggingFace mirror, filters by available wavs, concatenates same-speaker short clips into 10-15 s prompt wavs, and writes a CosyVoice-compatible speaker catalog.
