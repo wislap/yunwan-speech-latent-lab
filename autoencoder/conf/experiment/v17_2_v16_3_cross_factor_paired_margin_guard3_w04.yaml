@@ -1,0 +1,32 @@
+# V17.2 guard3: margin speaker separation + shared/full-latent guard.
+#
+# The speaker projection is no longer forced to cosine -1 for different
+# speakers. Different speakers only need to be below a margin, and same-speaker
+# samples only need to be above a margin. This avoids making a two-speaker
+# dataset collapse naturally into a single positive/negative speaker axis.
+
+defaults:
+  - v17_2_v16_3_cross_factor_paired_rank_guard_w04
+  - _self_
+
+version_tag: v17.2_v16.3_cross_factor_paired_margin_guard3_w04
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17.2_v16.3_cross_factor_paired_margin_guard3_w04
+
+  v17_cross_factor_weight: 0.4
+  v17_cross_factor_speaker_margin_mode: true
+  v17_cross_factor_speaker_neg_margin: -0.2
+  v17_cross_factor_speaker_pos_margin: 0.6
+  v17_cross_factor_speaker_weight: 0.5
+  v17_cross_factor_speaker_same_weight: 0.15
+
+  v17_cross_factor_rank_guard_min_std: 0.06
+  v17_cross_factor_rank_guard_max_top1: 0.60
+  v17_cross_factor_phoneme_rank_guard_weight: 0.06
+  v17_cross_factor_speaker_rank_guard_weight: 0.02
+  v17_cross_factor_latent_rank_guard_weight: 0.20
+  v17_cross_factor_rank_guard_covariance_weight: 0.005
+  v17_cross_factor_rank_guard_top1_weight: 1.0

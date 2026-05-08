@@ -1,0 +1,30 @@
+# V17.2 guard2: keep dense paired supervision, make shared-space guard stronger.
+#
+# Compared with the first V17.2 probe:
+# - keep cross_factor_weight=0.4 and paired sampler.
+# - reduce speaker pull/push sharpness a little.
+# - strengthen full-latent and speaker anti-collapse guards.
+# - enable covariance guard so the guard is not only a top-eigen monitor.
+
+defaults:
+  - v17_2_v16_3_cross_factor_paired_rank_guard_w04
+  - _self_
+
+version_tag: v17.2_v16.3_cross_factor_paired_rank_guard2_w04
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17.2_v16.3_cross_factor_paired_rank_guard2_w04
+
+  v17_cross_factor_weight: 0.4
+  v17_cross_factor_speaker_weight: 0.5
+  v17_cross_factor_speaker_same_weight: 0.15
+
+  v17_cross_factor_rank_guard_min_std: 0.08
+  v17_cross_factor_rank_guard_max_top1: 0.55
+  v17_cross_factor_phoneme_rank_guard_weight: 0.08
+  v17_cross_factor_speaker_rank_guard_weight: 0.15
+  v17_cross_factor_latent_rank_guard_weight: 0.20
+  v17_cross_factor_rank_guard_covariance_weight: 0.01
+  v17_cross_factor_rank_guard_top1_weight: 1.0

@@ -1,0 +1,31 @@
+# V17.2 guard4: guard3 + hard same-speaker phoneme negatives.
+#
+# Guard3 fixed the worst full-latent collapse by replacing speaker anti-pairs
+# with margins. Guard4 keeps that behavior and adds a targeted phoneme hinge:
+# same-speaker/different-text samples may be similar only up to the external
+# pinyin-bag overlap plus a small margin. This directly attacks the observed
+# diff_text_same_speaker phoneme cosine collapse without supervising residuals.
+
+defaults:
+  - v17_2_v16_3_cross_factor_paired_margin_guard3_w04
+  - _self_
+
+version_tag: v17.2_v16.3_cross_factor_paired_margin_guard4_w04
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17.2_v16.3_cross_factor_paired_margin_guard4_w04
+
+  # Slightly softer global pressure than guard3; the new hard-negative term is
+  # narrow and should carry the phoneme separation signal.
+  v17_cross_factor_weight: 0.35
+
+  v17_cross_factor_phoneme_same_speaker_neg_weight: 0.8
+  v17_cross_factor_phoneme_same_speaker_neg_margin: 0.15
+  v17_cross_factor_phoneme_same_speaker_neg_max_cos: 0.65
+
+  # Let text-aware hard negatives do more work, instead of asking rank guard to
+  # spread everything uniformly.
+  v17_cross_factor_phoneme_uniform_weight: 0.03
+  v17_cross_factor_phoneme_rank_guard_weight: 0.04

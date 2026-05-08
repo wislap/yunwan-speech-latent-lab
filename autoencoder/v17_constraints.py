@@ -99,6 +99,59 @@ def _row_speaker_key(row: dict) -> str:
     return str(row.get("same_speaker_group") or row.get("speaker_id") or row.get("speaker") or "")
 
 
+def _rank_guard_loss(
+    values: torch.Tensor,
+    min_std: float,
+    max_top1: float,
+    variance_weight: float,
+    covariance_weight: float,
+    top1_weight: float,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """VICReg-style anti-collapse guard for factor or full-latent features.
+
+    This is deliberately not a residual supervision target. It only preserves
+    enough active dimensions and discourages a single principal direction from
+    swallowing the shared/free capacity.
+    """
+    if values.shape[0] < 2:
+        zero = values.sum() * 0.0
+        return zero, {
+            "var": zero.detach(),
+            "cov": zero.detach(),
+            "top1": zero.detach(),
+            "std": zero.detach(),
+        }
+
+    with torch.amp.autocast(device_type=values.device.type, enabled=False):
+        x = values.float()
+        x = x - x.mean(dim=0, keepdim=True)
+        std = torch.sqrt(x.var(dim=0, unbiased=False) + 1e-4)
+        var_loss = F.relu(float(min_std) - std).mean()
+
+        denom = max(x.shape[0] - 1, 1)
+        cov = (x.T @ x) / denom
+        diag = torch.diag(cov)
+        off_diag = cov - torch.diag_embed(diag)
+        cov_loss = off_diag.pow(2).sum() / max(x.shape[1], 1)
+
+        eigvals = torch.linalg.eigvalsh(cov).clamp_min(0.0)
+        total_power = eigvals.sum().clamp_min(1e-6)
+        top1 = eigvals[-1] / total_power
+        top1_loss = F.relu(top1 - float(max_top1)).pow(2)
+
+    loss = (
+        float(variance_weight) * var_loss
+        + float(covariance_weight) * cov_loss
+        + float(top1_weight) * top1_loss
+    )
+    return loss, {
+        "var": var_loss.detach(),
+        "cov": cov_loss.detach(),
+        "top1": top1.detach(),
+        "std": std.mean().detach(),
+    }
+
+
 class PinyinToneEncoder:
     """Convert Chinese text to pinyin+tone tokens.
 
@@ -576,8 +629,22 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
         phoneme_soft_weight: float = 1.0,
         phoneme_soft_hard_weight: float = 2.0,
         phoneme_soft_text_buckets: int = 512,
+        phoneme_same_speaker_neg_weight: float = 0.0,
+        phoneme_same_speaker_neg_margin: float = 0.15,
+        phoneme_same_speaker_neg_max_cos: float = 0.65,
         speaker_opposite_weight: float = 1.0,
+        speaker_same_weight: float = 0.0,
         speaker_target_cos: float = -1.0,
+        speaker_margin_mode: bool = False,
+        speaker_neg_margin: float = -0.2,
+        speaker_pos_margin: float = 0.6,
+        rank_guard_min_std: float = 0.03,
+        rank_guard_max_top1: float = 0.75,
+        phoneme_rank_guard_weight: float = 0.0,
+        speaker_rank_guard_weight: float = 0.0,
+        latent_rank_guard_weight: float = 0.0,
+        rank_guard_covariance_weight: float = 0.0,
+        rank_guard_top1_weight: float = 1.0,
         detach_latent: bool = False,
     ):
         super().__init__()
@@ -590,8 +657,22 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
         self.phoneme_soft_weight = phoneme_soft_weight
         self.phoneme_soft_hard_weight = phoneme_soft_hard_weight
         self.phoneme_text_buckets = phoneme_soft_text_buckets
+        self.phoneme_same_speaker_neg_weight = phoneme_same_speaker_neg_weight
+        self.phoneme_same_speaker_neg_margin = phoneme_same_speaker_neg_margin
+        self.phoneme_same_speaker_neg_max_cos = phoneme_same_speaker_neg_max_cos
         self.speaker_opposite_weight = speaker_opposite_weight
+        self.speaker_same_weight = speaker_same_weight
         self.speaker_target_cos = speaker_target_cos
+        self.speaker_margin_mode = speaker_margin_mode
+        self.speaker_neg_margin = speaker_neg_margin
+        self.speaker_pos_margin = speaker_pos_margin
+        self.rank_guard_min_std = rank_guard_min_std
+        self.rank_guard_max_top1 = rank_guard_max_top1
+        self.phoneme_rank_guard_weight = phoneme_rank_guard_weight
+        self.speaker_rank_guard_weight = speaker_rank_guard_weight
+        self.latent_rank_guard_weight = latent_rank_guard_weight
+        self.rank_guard_covariance_weight = rank_guard_covariance_weight
+        self.rank_guard_top1_weight = rank_guard_top1_weight
         self.detach_latent = detach_latent
         self.pinyin = PinyinToneEncoder(buckets=phoneme_soft_text_buckets)
 
@@ -607,19 +688,23 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
 
         self.register_buffer("queue_phoneme", torch.zeros(queue_size, phoneme_dim), persistent=True)
         self.register_buffer("queue_speaker", torch.zeros(queue_size, speaker_dim), persistent=True)
+        self.register_buffer("queue_latent", torch.zeros(queue_size, latent_dim), persistent=True)
         self.register_buffer("queue_text_vec", torch.zeros(queue_size, phoneme_soft_text_buckets), persistent=True)
         self.register_buffer("queue_text_keys", torch.full((queue_size,), -1, dtype=torch.long), persistent=True)
         self.register_buffer("queue_speaker_keys", torch.full((queue_size,), -1, dtype=torch.long), persistent=True)
         self.register_buffer("queue_ptr", torch.zeros((), dtype=torch.long), persistent=True)
         self.register_buffer("queue_filled", torch.zeros((), dtype=torch.long), persistent=True)
 
-    def _encode(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        z_in = z.detach() if self.detach_latent else z
-        pooled = z_in.mean(dim=-1).float()
+    def _project_pooled(self, pooled: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         h = self.trunk(self.norm(pooled))
         phoneme = F.normalize(self.phoneme_head(h), dim=-1)
         speaker = F.normalize(self.speaker_head(h), dim=-1)
         return phoneme, speaker
+
+    def _encode(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        z_in = z.detach() if self.detach_latent else z
+        pooled = z_in.mean(dim=-1).float()
+        return self._project_pooled(pooled)
 
     def _keys(self, metadata: Any, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         rows = _metadata_list(metadata, batch_size)
@@ -651,6 +736,7 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
         self,
         phoneme: torch.Tensor,
         speaker: torch.Tensor,
+        latent_pooled: torch.Tensor,
         text_vec: torch.Tensor,
         text_keys: torch.Tensor,
         speaker_keys: torch.Tensor,
@@ -659,6 +745,7 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             return
         phoneme = phoneme.detach()
         speaker = speaker.detach()
+        latent_pooled = latent_pooled.detach()
         text_vec = text_vec.detach()
         text_keys = text_keys.detach()
         speaker_keys = speaker_keys.detach()
@@ -668,6 +755,7 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
         if n >= self.queue_size:
             self.queue_phoneme.copy_(phoneme[-self.queue_size :])
             self.queue_speaker.copy_(speaker[-self.queue_size :])
+            self.queue_latent.copy_(latent_pooled[-self.queue_size :])
             self.queue_text_vec.copy_(text_vec[-self.queue_size :])
             self.queue_text_keys.copy_(text_keys[-self.queue_size :])
             self.queue_speaker_keys.copy_(speaker_keys[-self.queue_size :])
@@ -680,6 +768,7 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
         if end <= self.queue_size:
             self.queue_phoneme[ptr:end].copy_(phoneme)
             self.queue_speaker[ptr:end].copy_(speaker)
+            self.queue_latent[ptr:end].copy_(latent_pooled)
             self.queue_text_vec[ptr:end].copy_(text_vec)
             self.queue_text_keys[ptr:end].copy_(text_keys)
             self.queue_speaker_keys[ptr:end].copy_(speaker_keys)
@@ -688,11 +777,13 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             rest = end - self.queue_size
             self.queue_phoneme[ptr:].copy_(phoneme[:first])
             self.queue_speaker[ptr:].copy_(speaker[:first])
+            self.queue_latent[ptr:].copy_(latent_pooled[:first])
             self.queue_text_vec[ptr:].copy_(text_vec[:first])
             self.queue_text_keys[ptr:].copy_(text_keys[:first])
             self.queue_speaker_keys[ptr:].copy_(speaker_keys[:first])
             self.queue_phoneme[:rest].copy_(phoneme[first:])
             self.queue_speaker[:rest].copy_(speaker[first:])
+            self.queue_latent[:rest].copy_(latent_pooled[first:])
             self.queue_text_vec[:rest].copy_(text_vec[first:])
             self.queue_text_keys[:rest].copy_(text_keys[first:])
             self.queue_speaker_keys[:rest].copy_(speaker_keys[first:])
@@ -702,32 +793,42 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
     def forward(self, z: torch.Tensor, metadata: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         b = z.shape[0]
         device = z.device
-        phoneme, speaker = self._encode(z)
+        z_in = z.detach() if self.detach_latent else z
+        pooled = z_in.mean(dim=-1).float()
+        phoneme, speaker = self._project_pooled(pooled)
+        latent_pooled = F.layer_norm(pooled, (pooled.shape[-1],))
         text_keys, speaker_keys = self._keys(metadata, b, device)
         text_vec = self._text_vectors(metadata, b, device)
 
         bank_n = int(self.queue_filled.item())
         if bank_n > 0:
-            bank_phoneme = self.queue_phoneme[:bank_n].to(device=device, dtype=phoneme.dtype).clone()
-            bank_speaker = self.queue_speaker[:bank_n].to(device=device, dtype=speaker.dtype).clone()
+            bank_pooled = self.queue_latent[:bank_n].to(device=device, dtype=pooled.dtype).clone()
+            bank_phoneme, bank_speaker = self._project_pooled(bank_pooled)
+            bank_latent = F.layer_norm(bank_pooled, (bank_pooled.shape[-1],))
             bank_text_vec = self.queue_text_vec[:bank_n].to(device=device, dtype=text_vec.dtype).clone()
             bank_text = self.queue_text_keys[:bank_n].to(device=device)
             bank_spk = self.queue_speaker_keys[:bank_n].to(device=device)
             pair_mask = text_keys[:, None].eq(bank_text[None, :]) & ~speaker_keys[:, None].eq(bank_spk[None, :])
             nce_positive_mask = text_keys[:, None].eq(bank_text[None, :])
+            same_speaker_mask = speaker_keys[:, None].eq(bank_spk[None, :]) & ~text_keys[:, None].eq(bank_text[None, :])
         else:
             bank_phoneme = phoneme.new_zeros((0, phoneme.shape[-1]))
             bank_speaker = speaker.new_zeros((0, speaker.shape[-1]))
+            bank_latent = latent_pooled.new_zeros((0, latent_pooled.shape[-1]))
             bank_text_vec = text_vec.new_zeros((0, text_vec.shape[-1]))
             pair_mask = torch.zeros((b, 0), device=device, dtype=torch.bool)
             nce_positive_mask = torch.zeros((b, 0), device=device, dtype=torch.bool)
+            same_speaker_mask = torch.zeros((b, 0), device=device, dtype=torch.bool)
 
         valid = pair_mask.any(dim=1)
         if bool(valid.any()):
             phoneme_cos = phoneme @ bank_phoneme.T
             speaker_cos = speaker @ bank_speaker.T
             phoneme_loss = (1.0 - phoneme_cos)[pair_mask].mean()
-            speaker_loss = (speaker_cos[pair_mask] - self.speaker_target_cos).pow(2).mean()
+            if self.speaker_margin_mode:
+                speaker_loss = F.relu(speaker_cos[pair_mask] - self.speaker_neg_margin).pow(2).mean()
+            else:
+                speaker_loss = (speaker_cos[pair_mask] - self.speaker_target_cos).pow(2).mean()
             phoneme_cos_mean = phoneme_cos[pair_mask].mean()
             speaker_cos_mean = speaker_cos[pair_mask].mean()
             pairs = pair_mask.sum().float()
@@ -738,6 +839,20 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             phoneme_cos_mean = zero.detach()
             speaker_cos_mean = zero.detach()
             pairs = torch.tensor(0.0, device=device)
+
+        same_speaker_valid = same_speaker_mask.any(dim=1)
+        if bool(same_speaker_valid.any()):
+            speaker_same_cos = speaker @ bank_speaker.T
+            if self.speaker_margin_mode:
+                speaker_same_loss = F.relu(self.speaker_pos_margin - speaker_same_cos[same_speaker_mask]).pow(2).mean()
+            else:
+                speaker_same_loss = (1.0 - speaker_same_cos)[same_speaker_mask].mean()
+            speaker_same_cos_mean = speaker_same_cos[same_speaker_mask].mean()
+            same_speaker_pairs = same_speaker_mask.sum().float()
+        else:
+            speaker_same_loss = speaker.sum() * 0.0
+            speaker_same_cos_mean = speaker_same_loss.detach()
+            same_speaker_pairs = torch.tensor(0.0, device=device)
 
         nce_valid = nce_positive_mask.any(dim=1)
         if bool(nce_valid.any()):
@@ -760,6 +875,34 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             phoneme_uniform = F.relu(sim.masked_select(~eye) - 0.20).pow(2).mean()
         else:
             phoneme_uniform = phoneme.sum() * 0.0
+            all_phoneme = phoneme
+
+        all_speaker = torch.cat([speaker, bank_speaker], dim=0) if bank_n > 0 else speaker
+        all_latent = torch.cat([latent_pooled, bank_latent], dim=0) if bank_n > 0 else latent_pooled
+        phoneme_rank_guard, phoneme_rank_logs = _rank_guard_loss(
+            all_phoneme,
+            self.rank_guard_min_std,
+            self.rank_guard_max_top1,
+            self.phoneme_rank_guard_weight,
+            self.rank_guard_covariance_weight,
+            self.rank_guard_top1_weight,
+        )
+        speaker_rank_guard, speaker_rank_logs = _rank_guard_loss(
+            all_speaker,
+            self.rank_guard_min_std,
+            self.rank_guard_max_top1,
+            self.speaker_rank_guard_weight,
+            self.rank_guard_covariance_weight,
+            self.rank_guard_top1_weight,
+        )
+        latent_rank_guard, latent_rank_logs = _rank_guard_loss(
+            all_latent,
+            self.rank_guard_min_std,
+            self.rank_guard_max_top1,
+            self.latent_rank_guard_weight,
+            self.rank_guard_covariance_weight,
+            self.rank_guard_top1_weight,
+        )
 
         if bank_n > 0:
             all_phoneme_cos = phoneme @ bank_phoneme.T
@@ -776,22 +919,45 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             else:
                 soft_neg_target_mean = phoneme.sum() * 0.0
                 soft_neg_cos_mean = phoneme.sum() * 0.0
+            if self.phoneme_same_speaker_neg_weight > 0 and bool(same_speaker_mask.any()):
+                # Same speaker but different text is the hardest anti-collapse
+                # case for the phoneme head: speaker cues are held constant, so
+                # remaining similarity should be bounded by symbolic text overlap.
+                same_speaker_target = (
+                    target_sim[same_speaker_mask].detach() + float(self.phoneme_same_speaker_neg_margin)
+                ).clamp(max=float(self.phoneme_same_speaker_neg_max_cos))
+                same_speaker_phoneme_cos = all_phoneme_cos[same_speaker_mask]
+                phoneme_same_speaker_neg = F.relu(same_speaker_phoneme_cos - same_speaker_target).pow(2).mean()
+                phoneme_same_speaker_neg_cos = same_speaker_phoneme_cos.mean()
+                phoneme_same_speaker_neg_target = same_speaker_target.mean()
+            else:
+                phoneme_same_speaker_neg = phoneme.sum() * 0.0
+                phoneme_same_speaker_neg_cos = phoneme.sum() * 0.0
+                phoneme_same_speaker_neg_target = phoneme.sum() * 0.0
         else:
             phoneme_soft = phoneme.sum() * 0.0
             soft_target_mean = phoneme.sum() * 0.0
             soft_cos_mean = phoneme.sum() * 0.0
             soft_neg_target_mean = phoneme.sum() * 0.0
             soft_neg_cos_mean = phoneme.sum() * 0.0
+            phoneme_same_speaker_neg = phoneme.sum() * 0.0
+            phoneme_same_speaker_neg_cos = phoneme.sum() * 0.0
+            phoneme_same_speaker_neg_target = phoneme.sum() * 0.0
 
         total = (
             self.phoneme_weight * phoneme_loss
             + self.phoneme_nce_weight * phoneme_nce
             + self.phoneme_uniform_weight * phoneme_uniform
             + self.phoneme_soft_weight * phoneme_soft
+            + self.phoneme_same_speaker_neg_weight * phoneme_same_speaker_neg
             + self.speaker_opposite_weight * speaker_loss
+            + self.speaker_same_weight * speaker_same_loss
+            + phoneme_rank_guard
+            + speaker_rank_guard
+            + latent_rank_guard
         )
         with torch.no_grad():
-            self._enqueue(phoneme, speaker, text_vec, text_keys, speaker_keys)
+            self._enqueue(phoneme, speaker, pooled, text_vec, text_keys, speaker_keys)
 
         logs = {
             "v17_cross_factor_total": total,
@@ -800,15 +966,30 @@ class CrossSampleFactorAlignmentConstraint(nn.Module):
             "v17_cross_phoneme_top1": phoneme_top1.detach(),
             "v17_cross_phoneme_uniform": phoneme_uniform,
             "v17_cross_phoneme_soft": phoneme_soft,
+            "v17_cross_phoneme_same_speaker_neg": phoneme_same_speaker_neg,
+            "v17_cross_phoneme_same_speaker_neg_cos": phoneme_same_speaker_neg_cos.detach(),
+            "v17_cross_phoneme_same_speaker_neg_target": phoneme_same_speaker_neg_target.detach(),
             "v17_cross_soft_target": soft_target_mean.detach(),
             "v17_cross_soft_cos": soft_cos_mean.detach(),
             "v17_cross_soft_neg_target": soft_neg_target_mean.detach(),
             "v17_cross_soft_neg_cos": soft_neg_cos_mean.detach(),
             "v17_cross_speaker_opp": speaker_loss,
+            "v17_cross_speaker_same": speaker_same_loss,
             "v17_cross_pairs": pairs.detach(),
+            "v17_cross_same_speaker_pairs": same_speaker_pairs.detach(),
             "v17_cross_nce_pos": nce_positive_mask.sum().float().detach(),
             "v17_cross_phoneme_cos": phoneme_cos_mean.detach(),
             "v17_cross_speaker_cos": speaker_cos_mean.detach(),
+            "v17_cross_speaker_same_cos": speaker_same_cos_mean.detach(),
+            "v17_cross_phoneme_rank_guard": phoneme_rank_guard.detach(),
+            "v17_cross_speaker_rank_guard": speaker_rank_guard.detach(),
+            "v17_cross_latent_rank_guard": latent_rank_guard.detach(),
+            "v17_cross_phoneme_rank_top1": phoneme_rank_logs["top1"],
+            "v17_cross_speaker_rank_top1": speaker_rank_logs["top1"],
+            "v17_cross_latent_rank_top1": latent_rank_logs["top1"],
+            "v17_cross_phoneme_std": phoneme_rank_logs["std"],
+            "v17_cross_speaker_std": speaker_rank_logs["std"],
+            "v17_cross_latent_std": latent_rank_logs["std"],
             "v17_cross_queue": torch.tensor(float(bank_n), device=device),
         }
         return total, logs
@@ -898,8 +1079,22 @@ class V17ConstraintModule(nn.Module):
         cross_factor_phoneme_soft_weight: float = 1.0,
         cross_factor_phoneme_soft_hard_weight: float = 2.0,
         cross_factor_phoneme_soft_text_buckets: int = 512,
+        cross_factor_phoneme_same_speaker_neg_weight: float = 0.0,
+        cross_factor_phoneme_same_speaker_neg_margin: float = 0.15,
+        cross_factor_phoneme_same_speaker_neg_max_cos: float = 0.65,
         cross_factor_speaker_weight: float = 1.0,
+        cross_factor_speaker_same_weight: float = 0.0,
         cross_factor_speaker_target_cos: float = -1.0,
+        cross_factor_speaker_margin_mode: bool = False,
+        cross_factor_speaker_neg_margin: float = -0.2,
+        cross_factor_speaker_pos_margin: float = 0.6,
+        cross_factor_rank_guard_min_std: float = 0.03,
+        cross_factor_rank_guard_max_top1: float = 0.75,
+        cross_factor_phoneme_rank_guard_weight: float = 0.0,
+        cross_factor_speaker_rank_guard_weight: float = 0.0,
+        cross_factor_latent_rank_guard_weight: float = 0.0,
+        cross_factor_rank_guard_covariance_weight: float = 0.0,
+        cross_factor_rank_guard_top1_weight: float = 1.0,
         cross_factor_detach_latent: bool = False,
         flow_hidden_dim: int = 512,
         flow_depth: int = 4,
@@ -952,8 +1147,22 @@ class V17ConstraintModule(nn.Module):
             phoneme_soft_weight=cross_factor_phoneme_soft_weight,
             phoneme_soft_hard_weight=cross_factor_phoneme_soft_hard_weight,
             phoneme_soft_text_buckets=cross_factor_phoneme_soft_text_buckets,
+            phoneme_same_speaker_neg_weight=cross_factor_phoneme_same_speaker_neg_weight,
+            phoneme_same_speaker_neg_margin=cross_factor_phoneme_same_speaker_neg_margin,
+            phoneme_same_speaker_neg_max_cos=cross_factor_phoneme_same_speaker_neg_max_cos,
             speaker_opposite_weight=cross_factor_speaker_weight,
+            speaker_same_weight=cross_factor_speaker_same_weight,
             speaker_target_cos=cross_factor_speaker_target_cos,
+            speaker_margin_mode=cross_factor_speaker_margin_mode,
+            speaker_neg_margin=cross_factor_speaker_neg_margin,
+            speaker_pos_margin=cross_factor_speaker_pos_margin,
+            rank_guard_min_std=cross_factor_rank_guard_min_std,
+            rank_guard_max_top1=cross_factor_rank_guard_max_top1,
+            phoneme_rank_guard_weight=cross_factor_phoneme_rank_guard_weight,
+            speaker_rank_guard_weight=cross_factor_speaker_rank_guard_weight,
+            latent_rank_guard_weight=cross_factor_latent_rank_guard_weight,
+            rank_guard_covariance_weight=cross_factor_rank_guard_covariance_weight,
+            rank_guard_top1_weight=cross_factor_rank_guard_top1_weight,
             detach_latent=cross_factor_detach_latent,
         )
         self.flow = LatentFlowConstraint(

@@ -258,6 +258,61 @@ class BucketSampler(torch.utils.data.Sampler):
         return len(self.sorted_indices)
 
 
+class PairedTextSampler(torch.utils.data.Sampler):
+    """Yield crossed-data items so same-text speaker variants stay adjacent.
+
+    V17 cross-factor constraints use a queue, so a batch size of 1 is still
+    useful when paired items arrive in consecutive steps. This sampler keeps
+    paired text groups dense without inventing a residual/shared supervision
+    target.
+    """
+
+    def __init__(
+        self,
+        items: list[dict],
+        positive_key: str = "same_text_group",
+        shuffle: bool = True,
+        drop_last: bool = False,
+    ):
+        self.items = items
+        self.positive_key = positive_key
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.groups: list[list[int]] = []
+        by_key: dict[str, list[int]] = {}
+        for idx, item in enumerate(items):
+            key = str(
+                item.get(positive_key)
+                or item.get("same_text_group")
+                or item.get("text_id")
+                or item.get("text")
+                or item.get("id")
+                or idx
+            )
+            by_key.setdefault(key, []).append(idx)
+        for group in by_key.values():
+            ordered = sorted(group, key=lambda i: str(items[i].get("speaker_id", "")))
+            if len(ordered) > 1 or not drop_last:
+                self.groups.append(ordered)
+
+    def __iter__(self):
+        order = list(range(len(self.groups)))
+        if self.shuffle and len(order) > 1:
+            order = torch.randperm(len(order)).tolist()
+        for group_idx in order:
+            group = list(self.groups[group_idx])
+            if self.shuffle and len(group) > 2:
+                # Keep speaker variants near each other while avoiding a fixed
+                # speaker order over long runs.
+                shift = int(torch.randint(0, len(group), (1,)).item())
+                group = group[shift:] + group[:shift]
+            for idx in group:
+                yield idx
+
+    def __len__(self):
+        return sum(len(group) for group in self.groups)
+
+
 def collate_audio(batch: list[torch.Tensor]) -> torch.Tensor:
     """Stack audio tensors into [B, 1, T]. Pads to longest in batch."""
     max_len = max(x.shape[0] for x in batch)
@@ -351,6 +406,77 @@ def safe_save(obj: dict, path: Path) -> None:
     tmp_path = path.with_suffix(".tmp")
     torch.save(obj, tmp_path)
     tmp_path.rename(path)
+
+
+def pcgrad_parameter_list(model: WavVAE) -> list[torch.nn.Parameter]:
+    """Parameters where V17 structure gradients should respect recon gradients."""
+    params: list[torch.nn.Parameter] = []
+    for module in (model.encoder, model.bottleneck):
+        params.extend(p for p in module.parameters() if p.requires_grad)
+    return params
+
+
+def backward_with_recon_pcgrad(
+    recon_loss: torch.Tensor,
+    struct_loss: torch.Tensor,
+    pc_params: list[torch.nn.Parameter],
+    grad_accum_steps: int,
+    eps: float = 1e-12,
+) -> dict[str, float]:
+    """Backprop recon and structure losses with PCGrad-lite on selected params.
+
+    Existing accumulated gradients on pc_params are preserved. Decoder gradients
+    come from recon normally; V17 head gradients come from structure normally.
+    Only the structure component on encoder/bottleneck is projected when it
+    conflicts with reconstruction.
+    """
+    prev_grads = [p.grad.detach().clone() if p.grad is not None else None for p in pc_params]
+    for p in pc_params:
+        p.grad = None
+
+    (recon_loss / grad_accum_steps).backward(retain_graph=True)
+    recon_grads = [p.grad.detach().clone() if p.grad is not None else None for p in pc_params]
+    for p in pc_params:
+        p.grad = None
+
+    (struct_loss / grad_accum_steps).backward()
+    struct_grads = [p.grad.detach().clone() if p.grad is not None else None for p in pc_params]
+
+    dot = torch.tensor(0.0, device=recon_loss.device)
+    recon_norm_sq = torch.tensor(0.0, device=recon_loss.device)
+    struct_norm_sq = torch.tensor(0.0, device=recon_loss.device)
+    for recon_grad, struct_grad in zip(recon_grads, struct_grads):
+        if recon_grad is None or struct_grad is None:
+            continue
+        r = recon_grad.float()
+        s = struct_grad.float()
+        dot = dot + (r * s).sum()
+        recon_norm_sq = recon_norm_sq + r.pow(2).sum()
+        struct_norm_sq = struct_norm_sq + s.pow(2).sum()
+
+    recon_norm = recon_norm_sq.sqrt()
+    struct_norm = struct_norm_sq.sqrt()
+    denom = (recon_norm * struct_norm).clamp_min(eps)
+    cosine = dot / denom
+    projected = bool(dot.item() < 0.0 and recon_norm_sq.item() > eps)
+    coeff = dot / recon_norm_sq.clamp_min(eps) if projected else torch.tensor(0.0, device=recon_loss.device)
+
+    for p, prev_grad, recon_grad, struct_grad in zip(pc_params, prev_grads, recon_grads, struct_grads):
+        final_grad = None
+        if recon_grad is not None:
+            final_grad = recon_grad
+        if struct_grad is not None:
+            adjusted = struct_grad - coeff.to(struct_grad.device, dtype=struct_grad.dtype) * recon_grad if projected and recon_grad is not None else struct_grad
+            final_grad = adjusted if final_grad is None else final_grad + adjusted
+        if prev_grad is not None:
+            final_grad = prev_grad if final_grad is None else final_grad + prev_grad
+        p.grad = final_grad
+
+    return {
+        "pcgrad_cos": float(cosine.detach().cpu()),
+        "pcgrad_projected": 1.0 if projected else 0.0,
+        "pcgrad_struct_over_recon": float((struct_norm / recon_norm.clamp_min(eps)).detach().cpu()),
+    }
 
 
 def _metadata_audio_length(metadata: dict | None, sr: int, fallback: int) -> int:
@@ -686,8 +812,28 @@ def train(args: DictConfig) -> None:
             cross_factor_phoneme_soft_weight=float(args.get("v17_cross_factor_phoneme_soft_weight", 1.0)),
             cross_factor_phoneme_soft_hard_weight=float(args.get("v17_cross_factor_phoneme_soft_hard_weight", 2.0)),
             cross_factor_phoneme_soft_text_buckets=int(args.get("v17_cross_factor_phoneme_soft_text_buckets", 512)),
+            cross_factor_phoneme_same_speaker_neg_weight=float(
+                args.get("v17_cross_factor_phoneme_same_speaker_neg_weight", 0.0)
+            ),
+            cross_factor_phoneme_same_speaker_neg_margin=float(
+                args.get("v17_cross_factor_phoneme_same_speaker_neg_margin", 0.15)
+            ),
+            cross_factor_phoneme_same_speaker_neg_max_cos=float(
+                args.get("v17_cross_factor_phoneme_same_speaker_neg_max_cos", 0.65)
+            ),
             cross_factor_speaker_weight=float(args.get("v17_cross_factor_speaker_weight", 1.0)),
+            cross_factor_speaker_same_weight=float(args.get("v17_cross_factor_speaker_same_weight", 0.0)),
             cross_factor_speaker_target_cos=float(args.get("v17_cross_factor_speaker_target_cos", -1.0)),
+            cross_factor_speaker_margin_mode=bool(args.get("v17_cross_factor_speaker_margin_mode", False)),
+            cross_factor_speaker_neg_margin=float(args.get("v17_cross_factor_speaker_neg_margin", -0.2)),
+            cross_factor_speaker_pos_margin=float(args.get("v17_cross_factor_speaker_pos_margin", 0.6)),
+            cross_factor_rank_guard_min_std=float(args.get("v17_cross_factor_rank_guard_min_std", 0.03)),
+            cross_factor_rank_guard_max_top1=float(args.get("v17_cross_factor_rank_guard_max_top1", 0.75)),
+            cross_factor_phoneme_rank_guard_weight=float(args.get("v17_cross_factor_phoneme_rank_guard_weight", 0.0)),
+            cross_factor_speaker_rank_guard_weight=float(args.get("v17_cross_factor_speaker_rank_guard_weight", 0.0)),
+            cross_factor_latent_rank_guard_weight=float(args.get("v17_cross_factor_latent_rank_guard_weight", 0.0)),
+            cross_factor_rank_guard_covariance_weight=float(args.get("v17_cross_factor_rank_guard_covariance_weight", 0.0)),
+            cross_factor_rank_guard_top1_weight=float(args.get("v17_cross_factor_rank_guard_top1_weight", 1.0)),
             cross_factor_detach_latent=bool(args.get("v17_cross_factor_detach_latent", False)),
             flow_hidden_dim=int(args.get("v17_flow_hidden_dim", 512)),
             flow_depth=int(args.get("v17_flow_depth", 4)),
@@ -836,10 +982,26 @@ def train(args: DictConfig) -> None:
                 collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
             )
         else:
+            paired_sampler_enable = bool(args.get("paired_text_sampler", False))
+            paired_sampler = None
+            shuffle = True
+            if paired_sampler_enable:
+                paired_sampler = PairedTextSampler(
+                    train_dataset.items,
+                    positive_key=str(args.get("paired_text_key", "same_text_group")),
+                    shuffle=bool(args.get("paired_text_shuffle", True)),
+                    drop_last=False,
+                )
+                shuffle = False
+                print(
+                    f"  PairedTextSampler: groups={len(paired_sampler.groups)}, "
+                    f"items={len(paired_sampler)}"
+                )
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=int(args.batch_size),
-                shuffle=True,
+                shuffle=shuffle,
+                sampler=paired_sampler,
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
@@ -943,6 +1105,9 @@ def train(args: DictConfig) -> None:
     nan_streak = 0
     max_nan_streak = 20
     disc_warmup_epochs = int(args.get("disc_warmup_epochs", 0))
+    v17_pcgrad_enable = bool(args.get("v17_pcgrad_enable", False))
+    pcgrad_params = pcgrad_parameter_list(model) if v17_pcgrad_enable else []
+    last_pcgrad_logs: dict[str, float] = {}
 
     print(f"\nStarting training: {epochs} epochs, adv starts at epoch {adv_start_epoch}")
     if disc_warmup_epochs > 0:
@@ -956,6 +1121,8 @@ def train(args: DictConfig) -> None:
         )
     if adv_enable:
         print(f"  Adv weights: g={adv_g_weight}, fm={adv_fm_weight}")
+    if v17_pcgrad_enable:
+        print(f"  V17 PCGrad-lite: params={sum(p.numel() for p in pcgrad_params):,} (encoder+bottleneck)")
     print()
 
     # ── Training loop ────────────────────────────────────────
@@ -1046,8 +1213,10 @@ def train(args: DictConfig) -> None:
                     multiband_stft_loss_fn=mb_stft_loss_fn,
                     multiband_stft_weight=mb_stft_weight,
                 )
-                g_loss = recon_losses["total"]
+                recon_total_loss = recon_losses["total"]
+                g_loss = recon_total_loss
                 v17_logs = {}
+                v17_loss = None
                 if v17_constraints is not None and metadata is not None and latent is None:
                     v17_loss, v17_logs = v17_constraints(out["z"], metadata)
                     g_loss = g_loss + v17_loss
@@ -1096,7 +1265,21 @@ def train(args: DictConfig) -> None:
 
             # Gradient accumulation
             if not disc_warming:
-                (g_loss / grad_accum_steps).backward()
+                use_v17_pcgrad = (
+                    v17_pcgrad_enable
+                    and v17_loss is not None
+                    and not use_adv
+                    and latent is None
+                )
+                if use_v17_pcgrad:
+                    last_pcgrad_logs = backward_with_recon_pcgrad(
+                        recon_total_loss,
+                        v17_loss,
+                        pcgrad_params,
+                        grad_accum_steps,
+                    )
+                else:
+                    (g_loss / grad_accum_steps).backward()
 
                 if (batch_idx + 1) % grad_accum_steps == 0:
                     g_norm = torch.nn.utils.clip_grad_norm_(g_params, grad_clip)
@@ -1176,14 +1359,29 @@ def train(args: DictConfig) -> None:
                             f"/ph={v17_logs['v17_cross_phoneme'].item():.4f}"
                             f"/nce={v17_logs['v17_cross_phoneme_nce'].item():.4f}"
                             f"/soft={v17_logs['v17_cross_phoneme_soft'].item():.4f}"
+                            f"/phhard={v17_logs['v17_cross_phoneme_same_speaker_neg'].item():.4f}"
                             f"/uni={v17_logs['v17_cross_phoneme_uniform'].item():.4f}"
                             f"/sp={v17_logs['v17_cross_speaker_opp'].item():.4f}"
+                            f"/spsame={v17_logs['v17_cross_speaker_same'].item():.4f}"
                             f"/pairs={v17_logs['v17_cross_pairs'].item():.0f}"
+                            f"/spairs={v17_logs['v17_cross_same_speaker_pairs'].item():.0f}"
                             f"/npos={v17_logs['v17_cross_nce_pos'].item():.0f}"
                             f"/ntop1={v17_logs['v17_cross_phoneme_top1'].item():.2f}"
                             f"/phcos={v17_logs['v17_cross_phoneme_cos'].item():.2f}"
                             f"/spcos={v17_logs['v17_cross_speaker_cos'].item():.2f}"
+                            f"/samespcos={v17_logs['v17_cross_speaker_same_cos'].item():.2f}"
+                            f"/rank={v17_logs['v17_cross_phoneme_rank_top1'].item():.2f},"
+                            f"{v17_logs['v17_cross_speaker_rank_top1'].item():.2f},"
+                            f"{v17_logs['v17_cross_latent_rank_top1'].item():.2f}"
+                            f"/phhardcos={v17_logs['v17_cross_phoneme_same_speaker_neg_cos'].item():.2f}"
+                            f"->{v17_logs['v17_cross_phoneme_same_speaker_neg_target'].item():.2f}"
                             f"/sneg={v17_logs['v17_cross_soft_neg_cos'].item():.2f}->{v17_logs['v17_cross_soft_neg_target'].item():.2f}"
+                        )
+                    if last_pcgrad_logs:
+                        msg += (
+                            f"/pcgcos={last_pcgrad_logs['pcgrad_cos']:.2f}"
+                            f"/pcgproj={last_pcgrad_logs['pcgrad_projected']:.0f}"
+                            f"/pcgratio={last_pcgrad_logs['pcgrad_struct_over_recon']:.2f}"
                         )
                     if "v17_flow" in v17_logs:
                         msg += f" flow={v17_logs['v17_flow'].item():.4f}"
