@@ -244,6 +244,53 @@ outputs/tts/cosyvoice3/crossed_zh_v0/manifest_val_pinyin.jsonl
 outputs/tts/cosyvoice3/crossed_zh_v0/summary.json
 ```
 
+## Fully Automatic Cross-Speaker Dataset Builder
+
+Use `scripts/build_cosyvoice3_cross_speaker_dataset.py` when extending an
+existing crossed dataset with more speakers. It derives the new text manifests
+from the real `same_text_group` values in the anchor manifests, so the expanded
+dataset stays strictly paired across speakers.
+
+Example on the CosyVoice3 server:
+
+```bash
+cd /root/autodl-tmp/project/CosyVoice_main
+/root/autodl-tmp/cosyvoice_env/bin/python scripts/build_cosyvoice3_cross_speaker_dataset.py \
+  --dataset-id crossed_zh_4spk_4h_scale_v0 \
+  --anchor-manifest 'outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_2spk_calib*/manifest.jsonl' \
+  --extra-speakers-json configs/cosyvoice3_speakers_4voice_with_aishell3.json \
+  --extra-speaker-id aishell3_SSB0631 \
+  --extra-speaker-id aishell3_SSB0426 \
+  --required-anchor-speakers spk_zero_shot,spk_cross_lingual \
+  --python-bin /root/autodl-tmp/cosyvoice_env/bin/python \
+  --parallel-synth 2 \
+  --fp16
+```
+
+Useful modes:
+
+```bash
+# Only create the paired add-speaker text manifests.
+--prepare-only
+
+# Reuse already synthesized add-speaker manifests and only merge/QC/postprocess.
+--skip-synth
+
+# Stop after raw/QC/train/val manifests, without pinyin/scaffold/neighbor files.
+--skip-postprocess
+```
+
+Main outputs:
+
+```text
+outputs/tts/cosyvoice3/<dataset-id>_texts_addspk_paired_calib.jsonl
+outputs/tts/cosyvoice3/<dataset-id>_addspk_paired_calib_<speaker_id>/manifest.jsonl
+outputs/tts/cosyvoice3/<dataset-id>_4spk_raw.jsonl
+outputs/tts/cosyvoice3/<dataset-id>_4spk_qc_<min>_<max>.jsonl
+outputs/tts/cosyvoice3/<dataset-id>_4spk_qc_<min>_<max>_train_phalign_neighbors.jsonl
+outputs/tts/cosyvoice3/<dataset-id>_4spk_qc_<min>_<max>_val_phalign_neighbors.jsonl
+```
+
 Summary:
 
 ```text

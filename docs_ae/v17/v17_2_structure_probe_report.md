@@ -513,7 +513,66 @@ V17.3 iteration should either use a stronger mature frontend/encoder
 larger/more speaker-diverse crossed set before treating this teacher as a
 distillation target.
 
-### 3. Frozen Head Probe
+### 3. V17.3 Conformer Content Teacher
+
+Implemented entry points:
+
+```text
+autoencoder/scripts/v17_3_train_conformer_teacher.py
+scripts/run_v17_3_conformer_teacher.sh
+```
+
+Architecture:
+
+```text
+waveform -> log-mel -> 2x conv subsampling -> torchaudio Conformer
+         -> frame pinyin head
+         -> attentive pooled content embedding
+```
+
+First 500-step probe:
+
+```text
+run:
+/root/autodl-tmp/project/outputs/models/v17_3_conformer_teacher_500
+
+hidden=192, emb=128, layers=4, heads=4, ffn=768
+segment=5s, groups_per_batch=8
+frame CE + pinyin bag + SupCon + hard negative + rank guard
+
+retrieval top1 = 0.094
+mean rank = 12.17
+same_text_diff_speaker cos = 0.735
+diff_text_same_speaker cos = 0.702
+rank95 = 25
+top1_var = 0.175
+speaker centroid acc = 0.422
+```
+
+This is the first V17.3 teacher run where the desired inequality appears:
+
+```text
+same_text_diff_speaker cos > diff_text_same_speaker cos
+```
+
+The retrieval score is still far below the target threshold, but the direction
+is materially healthier than the raw-waveform TCN teacher:
+
+- frame pinyin accuracy begins to move (`~0.14-0.17` by 500 steps);
+- same-speaker hard-negative cosine falls from near `1.0` to about `0.66` in
+  training;
+- rank stays healthy;
+- speaker centroid leakage is much lower than the early TCN/smoke runs.
+
+Current decision:
+
+```text
+Conformer teacher is the right V17.3 branch to scale.
+Do not distill to AE yet.
+Next run should be longer/larger or use the 4-speaker dataset target.
+```
+
+### 4. Frozen Head Probe
 
 Freeze the V16.3 AE entirely. Train only cross-factor heads.
 
@@ -530,7 +589,7 @@ Decision:
 - If frozen heads succeed, our previous failures came from gradient conflict,
   not lack of accessible information.
 
-### 4. Frozen Sequence Probe
+### 5. Frozen Sequence Probe
 
 Freeze V16.3. Replace utterance mean with a lightweight temporal content encoder:
 
@@ -547,7 +606,7 @@ Check whether phoneme/content is present locally but lost by mean pooling.
 
 This is the most important next step.
 
-### 5. Head-Only Warmup Before Encoder Gradients
+### 6. Head-Only Warmup Before Encoder Gradients
 
 For V17.2-style training:
 
@@ -559,7 +618,7 @@ phase 3: optionally let structure gradients reach more encoder layers
 
 This avoids immediately moving the decoder's familiar latent distribution.
 
-### 6. Larger Multi-Speaker Data Only After the Probe
+### 7. Larger Multi-Speaker Data Only After the Probe
 
 The next dataset scale should be at least:
 

@@ -781,6 +781,7 @@ def train(args: DictConfig) -> None:
             latent_dim=int(args.latent_dim),
             ext_weight=float(args.get("v17_ext_weight", 0.0)),
             flow_weight=float(args.get("v17_flow_weight", 0.0)),
+            teacher_distill_weight=float(args.get("v17_teacher_distill_weight", 0.0)),
             adapter_hidden_dim=int(args.get("v17_adapter_hidden_dim", 256)),
             text_buckets=int(args.get("v17_text_buckets", 512)),
             speaker_buckets=int(args.get("v17_speaker_buckets", 64)),
@@ -841,6 +842,29 @@ def train(args: DictConfig) -> None:
             flow_detach_target=bool(args.get("v17_flow_detach_target", True)),
             flow_min_t=float(args.get("v17_flow_min_t", 0.0)),
             flow_max_t=float(args.get("v17_flow_max_t", 1.0)),
+            teacher_checkpoint=str(args.get("v17_teacher_checkpoint", "")),
+            teacher_hidden_dim=int(args.get("v17_teacher_hidden_dim", 256)),
+            teacher_emb_dim=int(args.get("v17_teacher_emb_dim", 192)),
+            teacher_adapter_hidden_dim=int(args.get("v17_teacher_adapter_hidden_dim", 384)),
+            teacher_adapter_depth=int(args.get("v17_teacher_adapter_depth", 2)),
+            teacher_layers=int(args.get("v17_teacher_layers", 6)),
+            teacher_heads=int(args.get("v17_teacher_heads", 4)),
+            teacher_ffn_dim=int(args.get("v17_teacher_ffn_dim", 1024)),
+            teacher_sr=int(args.get("v17_teacher_sr", args.get("sr", 22050))),
+            teacher_n_fft=int(args.get("v17_teacher_n_fft", 1024)),
+            teacher_hop_length=int(args.get("v17_teacher_hop_length", 256)),
+            teacher_n_mels=int(args.get("v17_teacher_n_mels", 80)),
+            teacher_conv_kernel=int(args.get("v17_teacher_conv_kernel", 31)),
+            teacher_dropout=float(args.get("v17_teacher_dropout", 0.0)),
+            teacher_detach_latent=bool(args.get("v17_teacher_detach_latent", False)),
+            teacher_relational_weight=float(args.get("v17_teacher_relational_weight", 0.0)),
+            teacher_nce_weight=float(args.get("v17_teacher_nce_weight", 0.0)),
+            teacher_nce_temperature=float(args.get("v17_teacher_nce_temperature", 0.12)),
+            teacher_positive_key=str(args.get("v17_teacher_positive_key", args.get("paired_text_key", "same_text_group"))),
+            teacher_queue_size=int(args.get("v17_teacher_queue_size", 256)),
+            teacher_rank_guard_weight=float(args.get("v17_teacher_rank_guard_weight", 0.0)),
+            teacher_rank_guard_min_std=float(args.get("v17_teacher_rank_guard_min_std", 0.03)),
+            teacher_rank_guard_max_top1=float(args.get("v17_teacher_rank_guard_max_top1", 0.55)),
         ).to(device)
         print(
             "  V17 constraints: "
@@ -848,6 +872,7 @@ def train(args: DictConfig) -> None:
             f"semantic_weight={float(args.get('v17_semantic_weight', 0.0))}, "
             f"cross_factor_weight={float(args.get('v17_cross_factor_weight', 0.0))}, "
             f"flow_weight={float(args.get('v17_flow_weight', 0.0))}, "
+            f"teacher_distill_weight={float(args.get('v17_teacher_distill_weight', 0.0))}, "
             f"params={count_parameters(v17_constraints):,}"
         )
 
@@ -1218,7 +1243,7 @@ def train(args: DictConfig) -> None:
                 v17_logs = {}
                 v17_loss = None
                 if v17_constraints is not None and metadata is not None and latent is None:
-                    v17_loss, v17_logs = v17_constraints(out["z"], metadata)
+                    v17_loss, v17_logs = v17_constraints(out["z"], metadata, audio=audio)
                     g_loss = g_loss + v17_loss
 
                 # Adversarial losses (Phase 2)
@@ -1385,6 +1410,14 @@ def train(args: DictConfig) -> None:
                         )
                     if "v17_flow" in v17_logs:
                         msg += f" flow={v17_logs['v17_flow'].item():.4f}"
+                    if "v17_teacher_distill" in v17_logs:
+                        msg += (
+                            f" teach={v17_logs['v17_teacher_distill'].item():.4f}"
+                            f"/tcos={v17_logs['v17_teacher_cos'].item():.2f}"
+                            f"/trel={v17_logs.get('v17_teacher_rel', torch.tensor(0.0)).item():.3f}"
+                            f"/tnce={v17_logs.get('v17_teacher_nce', torch.tensor(0.0)).item():.3f}"
+                            f"/trank={v17_logs.get('v17_teacher_rank_top1', torch.tensor(0.0)).item():.2f}"
+                        )
                 if use_adv:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
                     if sb_adv_g_val > 0:

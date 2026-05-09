@@ -1040,6 +1040,221 @@ class LatentFlowConstraint(nn.Module):
         return loss, {"v17_flow": loss}
 
 
+class ExternalTeacherDistillConstraint(nn.Module):
+    """Distill a frozen audio teacher into an AE latent adapter.
+
+    The teacher sees the same cropped audio as reconstruction training. The AE
+    latent path receives gradients through a shallow adapter; the teacher stays
+    frozen and only provides a content-space target.
+    """
+
+    def __init__(
+        self,
+        latent_dim: int,
+        checkpoint: str = "",
+        hidden_dim: int = 384,
+        emb_dim: int = 192,
+        adapter_depth: int = 2,
+        teacher_hidden_dim: int = 256,
+        teacher_layers: int = 6,
+        teacher_heads: int = 4,
+        teacher_ffn_dim: int = 1024,
+        teacher_sr: int = 22050,
+        teacher_n_fft: int = 1024,
+        teacher_hop_length: int = 256,
+        teacher_n_mels: int = 80,
+        teacher_conv_kernel: int = 31,
+        teacher_dropout: float = 0.0,
+        text_buckets: int = 512,
+        detach_latent: bool = False,
+        relational_weight: float = 0.0,
+        nce_weight: float = 0.0,
+        nce_temperature: float = 0.12,
+        positive_key: str = "same_text_group",
+        queue_size: int = 256,
+        rank_guard_weight: float = 0.0,
+        rank_guard_min_std: float = 0.03,
+        rank_guard_max_top1: float = 0.55,
+    ):
+        super().__init__()
+        self.checkpoint = str(checkpoint or "")
+        self.detach_latent = detach_latent
+        self.relational_weight = float(relational_weight)
+        self.nce_weight = float(nce_weight)
+        self.nce_temperature = float(nce_temperature)
+        self.positive_key = positive_key
+        self.queue_size = max(int(queue_size), 0)
+        self.rank_guard_weight = float(rank_guard_weight)
+        self.rank_guard_min_std = float(rank_guard_min_std)
+        self.rank_guard_max_top1 = float(rank_guard_max_top1)
+        self._queue_text_keys: list[str] = []
+        self._queue_speaker_keys: list[str] = []
+        self.register_buffer("pred_queue", torch.empty(0, emb_dim), persistent=False)
+        self.register_buffer("target_queue", torch.empty(0, emb_dim), persistent=False)
+        self.teacher = None
+        if self.checkpoint:
+            from autoencoder.scripts.v17_3_train_conformer_teacher import LogMelConformerTeacher
+
+            self.teacher = LogMelConformerTeacher(
+                sr=teacher_sr,
+                n_fft=teacher_n_fft,
+                hop_length=teacher_hop_length,
+                n_mels=teacher_n_mels,
+                hidden_dim=teacher_hidden_dim,
+                emb_dim=emb_dim,
+                num_layers=teacher_layers,
+                num_heads=teacher_heads,
+                ffn_dim=teacher_ffn_dim,
+                conv_kernel=teacher_conv_kernel,
+                dropout=teacher_dropout,
+                text_buckets=text_buckets,
+            )
+            ckpt = torch.load(self.checkpoint, map_location="cpu", weights_only=False)
+            state = ckpt.get("model", ckpt) if isinstance(ckpt, dict) else ckpt
+            self.teacher.load_state_dict(state, strict=True)
+            self.teacher.eval()
+            for param in self.teacher.parameters():
+                param.requires_grad_(False)
+
+        blocks: list[nn.Module] = [
+            nn.Conv1d(latent_dim, hidden_dim, kernel_size=1),
+            nn.GroupNorm(8, hidden_dim),
+            nn.SiLU(),
+        ]
+        for _ in range(max(int(adapter_depth) - 1, 0)):
+            blocks.extend(
+                [
+                    nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                    nn.GroupNorm(8, hidden_dim),
+                    nn.SiLU(),
+                ]
+            )
+        self.adapter = nn.Sequential(*blocks)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, emb_dim),
+        )
+
+    def _pool(self, h: torch.Tensor) -> torch.Tensor:
+        return h.mean(dim=-1)
+
+    def _keys(self, metadata: Any, batch_size: int) -> tuple[list[str], list[str]]:
+        rows = _metadata_list(metadata, batch_size)
+        text_keys = [_row_text_key(row, self.positive_key) for row in rows]
+        speaker_keys = [_row_speaker_key(row) for row in rows]
+        return text_keys, speaker_keys
+
+    def _positive_mask(
+        self,
+        text_keys: list[str],
+        speaker_keys: list[str],
+        bank_text_keys: list[str],
+        bank_speaker_keys: list[str],
+        device: torch.device,
+    ) -> torch.Tensor:
+        mask = torch.zeros(len(text_keys), len(bank_text_keys), device=device, dtype=torch.bool)
+        for i, text_key in enumerate(text_keys):
+            for j, bank_text_key in enumerate(bank_text_keys):
+                if text_key and text_key == bank_text_key and speaker_keys[i] != bank_speaker_keys[j]:
+                    mask[i, j] = True
+        return mask
+
+    def _relational_loss(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        pred_bank: torch.Tensor,
+        target_bank: torch.Tensor,
+    ) -> torch.Tensor:
+        if pred_bank.shape[0] < 1:
+            return pred.sum() * 0.0
+        pred_sim = pred @ pred_bank.T
+        target_sim = target @ target_bank.T
+        return F.smooth_l1_loss(pred_sim, target_sim)
+
+    @torch.no_grad()
+    def _enqueue(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        text_keys: list[str],
+        speaker_keys: list[str],
+    ) -> None:
+        if self.queue_size <= 0 or pred.numel() == 0:
+            return
+        self.pred_queue = torch.cat([self.pred_queue.to(pred.device), pred.detach()], dim=0)[-self.queue_size :]
+        self.target_queue = torch.cat([self.target_queue.to(target.device), target.detach()], dim=0)[-self.queue_size :]
+        self._queue_text_keys = (self._queue_text_keys + list(text_keys))[-self.queue_size :]
+        self._queue_speaker_keys = (self._queue_speaker_keys + list(speaker_keys))[-self.queue_size :]
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        audio: torch.Tensor | None,
+        metadata: Any = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        if self.teacher is None or audio is None:
+            zero = z.sum() * 0.0
+            return zero, {
+                "v17_teacher_distill": zero.detach(),
+                "v17_teacher_cos": zero.detach(),
+                "v17_teacher_rel": zero.detach(),
+                "v17_teacher_nce": zero.detach(),
+                "v17_teacher_nce_acc": zero.detach(),
+                "v17_teacher_rank": zero.detach(),
+                "v17_teacher_rank_top1": zero.detach(),
+            }
+        z_in = z.detach() if self.detach_latent else z
+        pred = F.normalize(self.proj(self._pool(self.adapter(z_in.float()))), dim=-1)
+        with torch.no_grad():
+            teacher_audio = audio.float()
+            if teacher_audio.dim() == 3 and teacher_audio.shape[1] == 1:
+                teacher_audio = teacher_audio[:, 0, :]
+            with torch.amp.autocast(device_type=teacher_audio.device.type, enabled=False):
+                target = self.teacher(teacher_audio).detach()
+        target = F.normalize(target, dim=-1)
+        cos = (pred * target).sum(dim=-1)
+        point_loss = (1.0 - cos).mean()
+        text_keys, speaker_keys = self._keys(metadata, pred.shape[0]) if metadata is not None else ([], [])
+        bank_pred = torch.cat([self.pred_queue.to(pred.device), pred.detach()], dim=0)
+        bank_target = torch.cat([self.target_queue.to(target.device), target.detach()], dim=0)
+        bank_text_keys = self._queue_text_keys + text_keys
+        bank_speaker_keys = self._queue_speaker_keys + speaker_keys
+        rel_loss = self._relational_loss(pred, target, bank_pred, bank_target)
+        nce_loss = pred.sum() * 0.0
+        nce_acc = torch.tensor(0.0, device=pred.device)
+        if self.nce_weight > 0.0 and metadata is not None:
+            positive_mask = self._positive_mask(text_keys, speaker_keys, bank_text_keys, bank_speaker_keys, pred.device)
+            nce_loss, nce_acc = _masked_infonce(pred, bank_target.detach(), positive_mask, self.nce_temperature)
+        rank_loss, rank_logs = _rank_guard_loss(
+            pred,
+            min_std=self.rank_guard_min_std,
+            max_top1=self.rank_guard_max_top1,
+            variance_weight=1.0,
+            covariance_weight=0.01,
+            top1_weight=1.0,
+        )
+        loss = (
+            point_loss
+            + self.relational_weight * rel_loss
+            + self.nce_weight * nce_loss
+            + self.rank_guard_weight * rank_loss
+        )
+        self._enqueue(pred, target, text_keys, speaker_keys)
+        return loss, {
+            "v17_teacher_distill": loss,
+            "v17_teacher_point": point_loss.detach(),
+            "v17_teacher_cos": cos.mean().detach(),
+            "v17_teacher_rel": rel_loss.detach(),
+            "v17_teacher_nce": nce_loss.detach(),
+            "v17_teacher_nce_acc": nce_acc.detach(),
+            "v17_teacher_rank": rank_loss.detach(),
+            "v17_teacher_rank_top1": rank_logs["top1"].detach(),
+        }
+
+
 class V17ConstraintModule(nn.Module):
     """Combined V17 external adapter and flow constraints."""
 
@@ -1048,6 +1263,7 @@ class V17ConstraintModule(nn.Module):
         latent_dim: int,
         ext_weight: float = 0.0,
         flow_weight: float = 0.0,
+        teacher_distill_weight: float = 0.0,
         adapter_hidden_dim: int = 256,
         text_buckets: int = 512,
         speaker_buckets: int = 64,
@@ -1102,10 +1318,34 @@ class V17ConstraintModule(nn.Module):
         flow_detach_target: bool = True,
         flow_min_t: float = 0.0,
         flow_max_t: float = 1.0,
+        teacher_checkpoint: str = "",
+        teacher_hidden_dim: int = 256,
+        teacher_emb_dim: int = 192,
+        teacher_adapter_hidden_dim: int = 384,
+        teacher_adapter_depth: int = 2,
+        teacher_layers: int = 6,
+        teacher_heads: int = 4,
+        teacher_ffn_dim: int = 1024,
+        teacher_sr: int = 22050,
+        teacher_n_fft: int = 1024,
+        teacher_hop_length: int = 256,
+        teacher_n_mels: int = 80,
+        teacher_conv_kernel: int = 31,
+        teacher_dropout: float = 0.0,
+        teacher_detach_latent: bool = False,
+        teacher_relational_weight: float = 0.0,
+        teacher_nce_weight: float = 0.0,
+        teacher_nce_temperature: float = 0.12,
+        teacher_positive_key: str = "same_text_group",
+        teacher_queue_size: int = 256,
+        teacher_rank_guard_weight: float = 0.0,
+        teacher_rank_guard_min_std: float = 0.03,
+        teacher_rank_guard_max_top1: float = 0.55,
     ):
         super().__init__()
         self.ext_weight = ext_weight
         self.flow_weight = flow_weight
+        self.teacher_distill_weight = teacher_distill_weight
         self.semantic_weight = semantic_weight
         self.cross_factor_weight = cross_factor_weight
         self.external = ExternalAdapterConstraint(
@@ -1174,12 +1414,50 @@ class V17ConstraintModule(nn.Module):
             min_t=flow_min_t,
             max_t=flow_max_t,
         )
+        self.teacher_distill = ExternalTeacherDistillConstraint(
+            latent_dim=latent_dim,
+            checkpoint=teacher_checkpoint,
+            hidden_dim=teacher_adapter_hidden_dim,
+            emb_dim=teacher_emb_dim,
+            adapter_depth=teacher_adapter_depth,
+            teacher_hidden_dim=teacher_hidden_dim,
+            teacher_layers=teacher_layers,
+            teacher_heads=teacher_heads,
+            teacher_ffn_dim=teacher_ffn_dim,
+            teacher_sr=teacher_sr,
+            teacher_n_fft=teacher_n_fft,
+            teacher_hop_length=teacher_hop_length,
+            teacher_n_mels=teacher_n_mels,
+            teacher_conv_kernel=teacher_conv_kernel,
+            teacher_dropout=teacher_dropout,
+            text_buckets=text_buckets,
+            detach_latent=teacher_detach_latent,
+            relational_weight=teacher_relational_weight,
+            nce_weight=teacher_nce_weight,
+            nce_temperature=teacher_nce_temperature,
+            positive_key=teacher_positive_key,
+            queue_size=teacher_queue_size,
+            rank_guard_weight=teacher_rank_guard_weight,
+            rank_guard_min_std=teacher_rank_guard_min_std,
+            rank_guard_max_top1=teacher_rank_guard_max_top1,
+        )
 
     @property
     def enabled(self) -> bool:
-        return self.ext_weight > 0 or self.semantic_weight > 0 or self.cross_factor_weight > 0 or self.flow_weight > 0
+        return (
+            self.ext_weight > 0
+            or self.semantic_weight > 0
+            or self.cross_factor_weight > 0
+            or self.flow_weight > 0
+            or self.teacher_distill_weight > 0
+        )
 
-    def forward(self, z: torch.Tensor, metadata: Any) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    def forward(
+        self,
+        z: torch.Tensor,
+        metadata: Any,
+        audio: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         total = torch.tensor(0.0, device=z.device)
         logs: dict[str, torch.Tensor] = {}
         b = z.shape[0]
@@ -1200,5 +1478,9 @@ class V17ConstraintModule(nn.Module):
             flow_loss, flow_logs = self.flow(z, cond)
             total = total + self.flow_weight * flow_loss
             logs.update(flow_logs)
+        if self.teacher_distill_weight > 0:
+            teacher_loss, teacher_logs = self.teacher_distill(z, audio, metadata)
+            total = total + self.teacher_distill_weight * teacher_loss
+            logs.update(teacher_logs)
         logs["v17_total"] = total
         return total, logs
