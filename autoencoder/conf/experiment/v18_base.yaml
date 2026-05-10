@@ -1,0 +1,104 @@
+# V18 base: Generation-Aware Autoencoder (joint phoneme + residual + decoder)
+#
+# Phoneme encoder warm-started from V17.3 Conformer teacher.
+# Decoder warm-started from V16.3 best checkpoint.
+# Residual encoder trained from scratch.
+#
+# Loss: recon + lambda_phoneme * CTC on pinyin tokens.
+
+version_tag: v18_base
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v18_base
+  data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_train_phalign_neighbors.jsonl
+  eval_data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_val_phalign_neighbors.jsonl
+
+  # V18 model
+  model_type: v18
+  v18_phoneme_dim: 128
+  v18_residual_dim: 256
+  v18_residual_channels: [96, 192, 384, 768, 768]
+  v18_phoneme_hidden_dim: 256
+  v18_phoneme_layers: 4
+  v18_phoneme_heads: 4
+  v18_phoneme_ffn_dim: 1024
+  v18_phoneme_conv_kernel: 31
+  v18_phoneme_dropout: 0.0
+  v18_phoneme_n_mels: 80
+  v18_phoneme_n_fft: 1024
+  v18_phoneme_hop_length: 256
+  v18_ctc_vocab_size: 512
+  v18_lambda_phoneme: 0.3
+
+  # Pretrained init
+  v18_phoneme_checkpoint: ${runtime.project_root}/outputs/models/v17_3_conformer_teacher_4spk_qc_1000/best.pt
+  v18_decoder_checkpoint: ${runtime.project_root}/outputs/models/wav_vae_v16.3_256x_dim384_time_remote_main/best.pt
+
+  # Legacy fields required by train.py (unused in V18 path)
+  latent_dim: 384
+  strides: [2, 4, 4, 8]
+  encoder_channels: [128, 256, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+  sample_latent: false
+
+  # Bottleneck (V16.3 stable)
+  reg_weight: 1.0e-4
+  margin_mean: 6.0
+  std_min: 0.05
+  std_max: 3.0
+  reg_warmup_steps: 5000
+
+  # Reconstruction losses (V16.3 stable)
+  l1_time_weight: 10.0
+  l2_time_weight: 0.0
+  stft_weight: 0.5
+  mel_weight: 0.1
+  mb_stft_enable: false
+
+  # Disable V17 stack
+  v17_constraints_enable: false
+  v17_4_enable: false
+
+  # Training (V16.3 stable recipe)
+  use_checkpoint: true
+  batch_size: 1
+  grad_accum_steps: 16
+  lr: 1.0e-4
+  lr_warmup_steps: 1000
+  scheduler: cosine
+  grad_clip: 1.0
+  segment_length: 65536
+  epochs: 40
+  sr: 22050
+  augment: false
+
+  # Disable adversarial
+  adv_enable: false
+  adv_start_epoch: 999
+  adv_d_lr: 0
+  adv_g_weight: 0
+  adv_fm_weight: 0
+  freeze_encoder: false
+  freeze_decoder_blocks: false
+
+  # STFT/Mel configs (V16.3)
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  # Discriminator placeholders (disabled)
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  # Eval / logging
+  eval_every_epochs: 2
+  eval_batches: 8
+  log_interval: 50
+  num_workers: 4
+  prefetch_factor: 2

@@ -1,0 +1,25 @@
+# V18 Stage 1: Phoneme warmup.
+#
+# Freezes residual encoder + decoder. Only phoneme encoder + CTC head
+# receive gradient. Purpose: verify CTC can converge at the AE frame rate
+# before joint training.
+
+defaults:
+  - v18_base
+  - _self_
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/wav_vae_v18_phoneme_warmup_${runtime.site_tag}_${runtime.role_tag}
+  version_tag: v18_phoneme_warmup
+
+  v18_freeze_residual_and_decoder: true
+  # Drop recon weights to near-zero so only CTC drives learning. A small
+  # recon weight keeps the forward computation meaningful for bottleneck stats.
+  l1_time_weight: 0.1
+  stft_weight: 0.01
+  mel_weight: 0.01
+  v18_lambda_phoneme: 1.0
+  epochs: 2
+  log_interval: 20
+  lr: 3.0e-4
+  lr_warmup_steps: 100

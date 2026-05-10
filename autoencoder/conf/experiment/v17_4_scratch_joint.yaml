@@ -1,0 +1,112 @@
+# V17.4 From-scratch joint training.
+#
+# NO V16.3 initialization. Random init. Encoder/decoder learn from scratch
+# together with V17.4 structural constraints (flow + analogy).
+#
+# Stage 1 (0-3000 steps): Recon only, V17.4 weight = 0
+# Stage 2 (3000-10000 steps): Ramp V17.4 weight 0 → target
+# Stage 3 (10000+): Joint training at full weight
+
+version_tag: v17_4_scratch_joint
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17_4_scratch_joint
+  data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_train_phalign_neighbors.jsonl
+  eval_data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_val_phalign_neighbors.jsonl
+  # NO teacher_checkpoint — from scratch
+  teacher_checkpoint: ""
+
+  # AE architecture (matches V16.3)
+  latent_dim: 384
+  strides: [2, 4, 4, 8]
+  encoder_channels: [128, 256, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+
+  # VAE settings — relaxed for scratch training
+  sample_latent: false
+  reg_weight: 0          # Disabled entirely for scratch — latent is not yet well-behaved
+  margin_mean: 100.0     # Effectively disabled
+  std_min: 0.01
+  std_max: 100.0
+  reg_warmup_steps: 20000
+
+  # Reconstruction losses
+  l1_time_weight: 10.0
+  l2_time_weight: 0.0
+  stft_weight: 0.5
+  mel_weight: 0.1
+  mb_stft_enable: false
+
+  # ── V17.4 Flow + Analogy constraint ──
+  # NO probe checkpoint — structure is learned alongside recon from scratch
+  v17_4_enable: true
+  v17_4_weight: 0.02             # Target weight (after ramp), conservative
+  v17_4_weight_warmup_steps: 10000   # Recon-only for first 10K steps
+  v17_4_weight_ramp_steps: 10000     # Linear ramp from 0 to target over 10K steps
+  v17_4_probe_checkpoint: ""
+  v17_4_proj_dim: 64
+  v17_4_proj_hidden_dim: 256
+  v17_4_proj_depth: 3
+  v17_4_flow_hidden_dim: 256
+  v17_4_flow_depth: 4
+  v17_4_cond_emb_dim: 128
+  v17_4_n_text_groups: 1024
+  v17_4_n_speakers: 16
+  v17_4_flow_weight: 1.0
+  v17_4_analogy_weight: 0.3
+  v17_4_diversity_weight: 0.3
+  v17_4_diversity_max_cos: 0.5
+  v17_4_analogy_min_cos: -0.3
+  v17_4_speaker_centroid_momentum: 0.99
+  v17_4_warmup_steps: 0
+
+  # Disable old V17 constraints
+  v17_constraints_enable: false
+
+  # Training — match V16.3 config that successfully trained from scratch
+  use_checkpoint: true
+  batch_size: 1
+  grad_accum_steps: 16
+  lr: 1.0e-4
+  lr_warmup_steps: 1000
+  scheduler: cosine
+  grad_clip: 10.0          # V16.3 proven, not too aggressive
+  segment_length: 65536    # V16.3 proven size
+  epochs: 40
+  sr: 22050
+  augment: false
+
+  # Paired sampler for analogy loss
+  paired_text_sampler: true
+  paired_text_key: same_text_group
+
+  # No adversarial
+  adv_enable: false
+  adv_start_epoch: 999
+  adv_d_lr: 0
+  adv_g_weight: 0
+  adv_fm_weight: 0
+  freeze_encoder: false
+  freeze_decoder_blocks: false
+
+  # STFT/Mel configs
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  # Discriminator (disabled)
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  # Eval/logging
+  eval_every_epochs: 2
+  eval_batches: 4
+  log_interval: 50
+  num_workers: 2
+  prefetch_factor: 2

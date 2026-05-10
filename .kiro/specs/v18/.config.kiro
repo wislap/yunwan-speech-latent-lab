@@ -1,0 +1,7 @@
+specType: feature
+workflowType: design-first
+featureName: v18
+createdAt: 2026-05-10
+designPath: docs_ae/v18/v18_design.md
+requirementsPath: docs_ae/v18/v18_requirements.md
+tasksPath: docs_ae/v18/v18_tasks.md

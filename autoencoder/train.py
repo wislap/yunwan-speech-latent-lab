@@ -37,6 +37,7 @@ from autoencoder.models.discriminator import (
 from autoencoder.models.discriminator_v14 import V14Discriminator
 from autoencoder.v17_constraints import V17ConstraintModule
 from autoencoder.v17_4_flow_structure import V174FlowStructureModule
+from autoencoder.models.v18_encoder import V18Autoencoder
 
 
 # ─── Dataset ─────────────────────────────────────────────────
@@ -398,6 +399,99 @@ def compute_snr(x_hat: torch.Tensor, x: torch.Tensor) -> float:
     return 10.0 * math.log10(signal_power.item() / noise_power.item())
 
 
+# ─── V18 helpers ────────────────────────────────────────────
+
+
+def _stable_pinyin_id(token: str, vocab_size: int) -> int:
+    """Map a pinyin-like string to [1, vocab_size). 0 reserved for CTC blank."""
+    if vocab_size <= 1:
+        return 0
+    import hashlib
+    digest = hashlib.sha1(token.encode("utf-8")).digest()
+    bucket = int.from_bytes(digest[:8], "little") % (vocab_size - 1)
+    return bucket + 1
+
+
+def _compute_v18_ctc_loss(
+    log_probs: torch.Tensor,
+    metadata: list[dict],
+    vocab_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, dict[str, torch.Tensor]]:
+    """Compute frame-CTC loss from log_probs [B, T, vocab] and per-item pinyin.
+
+    Reads `pinyin_tokens` (or falls back to `phoneme_tokens`) from each
+    metadata dict, hashes them into vocab ids (reserving 0 for blank),
+    and calls F.ctc_loss. Items without any tokens are skipped.
+    """
+    B, T, V = log_probs.shape
+    target_lists: list[list[int]] = []
+    input_lengths_list: list[int] = []
+    valid_batch_idx: list[int] = []
+    for i, row in enumerate(metadata[:B]):
+        tokens = (
+            row.get("pinyin_tokens")
+            or row.get("phoneme_tokens")
+            or []
+        )
+        if not tokens:
+            continue
+        ids = [
+            _stable_pinyin_id(str(tok), vocab_size) for tok in tokens
+            if str(tok).strip()
+        ]
+        if not ids:
+            continue
+        target_lists.append(ids)
+        input_lengths_list.append(T)
+        valid_batch_idx.append(i)
+
+    if not target_lists:
+        return None, {}
+
+    # Filter log_probs to only valid items
+    if len(valid_batch_idx) < B:
+        log_probs = log_probs[valid_batch_idx]
+    # CTC expects [T, B, V] with log_softmax applied
+    log_probs_tbn = log_probs.transpose(0, 1).contiguous()  # [T, Bv, V]
+    target_flat = torch.tensor(
+        [t for toks in target_lists for t in toks],
+        dtype=torch.long,
+        device=device,
+    )
+    target_lengths = torch.tensor(
+        [len(t) for t in target_lists],
+        dtype=torch.long,
+        device=device,
+    )
+    input_lengths = torch.tensor(
+        input_lengths_list,
+        dtype=torch.long,
+        device=device,
+    )
+    # Clamp target length to <= input length for CTC validity
+    input_lengths = torch.maximum(input_lengths, target_lengths)
+    loss = F.ctc_loss(
+        log_probs_tbn.float(),
+        target_flat,
+        input_lengths,
+        target_lengths,
+        blank=0,
+        reduction="mean",
+        zero_infinity=True,
+    )
+    # Frame-argmax accuracy as a diagnostic
+    with torch.no_grad():
+        preds = log_probs.argmax(dim=-1)  # [Bv, T]
+        n_non_blank = (preds != 0).float().mean()
+    logs = {
+        "v18_ctc_loss": loss.detach(),
+        "v18_ctc_n_valid": torch.tensor(float(len(target_lists)), device=device),
+        "v18_ctc_non_blank_frac": n_non_blank,
+    }
+    return loss, logs
+
+
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
 
@@ -684,53 +778,105 @@ def train(args: DictConfig) -> None:
     sr = int(args.sr)
     segment_length = int(args.segment_length)
 
-    # ── Model ────────────────────────────────────────────────
-    model = WavVAE(
-        latent_dim=int(args.latent_dim),
-        encoder_channels=list(args.encoder_channels),
-        strides=list(args.strides),
-        dilations=list(args.dilations),
-        reg_weight=float(args.get("reg_weight", 1e-2)),
-        margin_mean=float(args.get("margin_mean", 3.0)),
-        std_min=float(args.get("std_min", 0.1)),
-        std_max=float(args.get("std_max", 1.5)),
-        reg_warmup_steps=int(args.get("reg_warmup_steps", 1000)),
-        sample_latent=bool(args.get("sample_latent", True)),
-        use_istft_decoder=bool(args.get("use_istft_decoder", False)),
-        istft_n_fft=int(args.get("istft_n_fft", 2048)),
-        istft_hop=int(args.get("istft_hop", 512)),
-        sr=sr,
-        use_phase_refiner=bool(args.get("use_phase_refiner", False)),
-        phase_n_fft=int(args.get("phase_n_fft", 2048)),
-        phase_hop=int(args.get("phase_hop", 512)),
-        use_vocos_decoder=bool(args.get("use_vocos_decoder", False)),
-        vocos_hidden_dim=int(args.get("vocos_hidden_dim", 1024)),
-        vocos_n_layers=int(args.get("vocos_n_layers", 8)),
-        vocos_n_fft=int(args.get("vocos_n_fft", 1024)),
-        vocos_hop=int(args.get("vocos_hop", 512)),
-        use_hybrid_decoder=bool(args.get("use_hybrid_decoder", False)),
-        hybrid_vocos_hidden=int(args.get("hybrid_vocos_hidden", 512)),
-        hybrid_vocos_layers=int(args.get("hybrid_vocos_layers", 4)),
-        hybrid_n_fft=int(args.get("hybrid_n_fft", 512)),
-        hybrid_hop=int(args.get("hybrid_hop", 128)),
-        use_dual_path_decoder=bool(args.get("use_dual_path_decoder", False)),
-        dual_vocos_hidden=int(args.get("dual_vocos_hidden", 512)),
-        dual_vocos_layers=int(args.get("dual_vocos_layers", 6)),
-        dual_n_fft=int(args.get("dual_n_fft", 1024)),
-        dual_hop=int(args.get("dual_hop", 256)),
-        use_checkpoint=bool(args.get("use_checkpoint", False)),
-    ).to(device)
+    # ── V18 detection ────────────────────────────────────────
+    model_type = str(args.get("model_type", "wavvae"))
+    is_v18 = model_type == "v18"
 
-    print(f"WavVAE parameters: {count_parameters(model):,}")
-    print(f"  Encoder: {count_parameters(model.encoder):,}")
-    print(f"  Decoder: {count_parameters(model.decoder):,}")
-    print(f"  Total stride: {model.total_stride}")
+    # ── Model ────────────────────────────────────────────────
+    if is_v18:
+        model = V18Autoencoder(
+            sr=sr,
+            phoneme_dim=int(args.get("v18_phoneme_dim", 128)),
+            residual_dim=int(args.get("v18_residual_dim", 256)),
+            strides=list(args.strides),
+            dilations=list(args.dilations),
+            residual_channels=list(args.get("v18_residual_channels", [96, 192, 384, 768, 768])),
+            phoneme_hidden_dim=int(args.get("v18_phoneme_hidden_dim", 256)),
+            phoneme_layers=int(args.get("v18_phoneme_layers", 4)),
+            phoneme_heads=int(args.get("v18_phoneme_heads", 4)),
+            phoneme_ffn_dim=int(args.get("v18_phoneme_ffn_dim", 1024)),
+            phoneme_conv_kernel=int(args.get("v18_phoneme_conv_kernel", 31)),
+            phoneme_dropout=float(args.get("v18_phoneme_dropout", 0.0)),
+            phoneme_n_mels=int(args.get("v18_phoneme_n_mels", 80)),
+            phoneme_n_fft=int(args.get("v18_phoneme_n_fft", 1024)),
+            phoneme_hop_length=int(args.get("v18_phoneme_hop_length", 256)),
+            phoneme_ctc_vocab_size=int(args.get("v18_ctc_vocab_size", 512)),
+            reg_weight=float(args.get("reg_weight", 1.0e-4)),
+            margin_mean=float(args.get("margin_mean", 6.0)),
+            std_min=float(args.get("std_min", 0.05)),
+            std_max=float(args.get("std_max", 3.0)),
+            reg_warmup_steps=int(args.get("reg_warmup_steps", 5000)),
+            use_checkpoint=bool(args.get("use_checkpoint", False)),
+        ).to(device)
+    else:
+        model = WavVAE(
+            latent_dim=int(args.latent_dim),
+            encoder_channels=list(args.encoder_channels),
+            strides=list(args.strides),
+            dilations=list(args.dilations),
+            reg_weight=float(args.get("reg_weight", 1e-2)),
+            margin_mean=float(args.get("margin_mean", 3.0)),
+            std_min=float(args.get("std_min", 0.1)),
+            std_max=float(args.get("std_max", 1.5)),
+            reg_warmup_steps=int(args.get("reg_warmup_steps", 1000)),
+            sample_latent=bool(args.get("sample_latent", True)),
+            use_istft_decoder=bool(args.get("use_istft_decoder", False)),
+            istft_n_fft=int(args.get("istft_n_fft", 2048)),
+            istft_hop=int(args.get("istft_hop", 512)),
+            sr=sr,
+            use_phase_refiner=bool(args.get("use_phase_refiner", False)),
+            phase_n_fft=int(args.get("phase_n_fft", 2048)),
+            phase_hop=int(args.get("phase_hop", 512)),
+            use_vocos_decoder=bool(args.get("use_vocos_decoder", False)),
+            vocos_hidden_dim=int(args.get("vocos_hidden_dim", 1024)),
+            vocos_n_layers=int(args.get("vocos_n_layers", 8)),
+            vocos_n_fft=int(args.get("vocos_n_fft", 1024)),
+            vocos_hop=int(args.get("vocos_hop", 512)),
+            use_hybrid_decoder=bool(args.get("use_hybrid_decoder", False)),
+            hybrid_vocos_hidden=int(args.get("hybrid_vocos_hidden", 512)),
+            hybrid_vocos_layers=int(args.get("hybrid_vocos_layers", 4)),
+            hybrid_n_fft=int(args.get("hybrid_n_fft", 512)),
+            hybrid_hop=int(args.get("hybrid_hop", 128)),
+            use_dual_path_decoder=bool(args.get("use_dual_path_decoder", False)),
+            dual_vocos_hidden=int(args.get("dual_vocos_hidden", 512)),
+            dual_vocos_layers=int(args.get("dual_vocos_layers", 6)),
+            dual_n_fft=int(args.get("dual_n_fft", 1024)),
+            dual_hop=int(args.get("dual_hop", 256)),
+            use_checkpoint=bool(args.get("use_checkpoint", False)),
+        ).to(device)
+
+    if is_v18:
+        print(f"V18 autoencoder parameters: {count_parameters(model):,}")
+        print(f"  Phoneme encoder: {count_parameters(model.phoneme_encoder):,}")
+        print(f"  Residual encoder: {count_parameters(model.residual_encoder):,}")
+        print(f"  Decoder: {count_parameters(model.decoder):,}")
+        print(f"  CTC head: {count_parameters(model.ctc_head):,}")
+        print(f"  Total stride: {model.total_stride}, latent_dim: {model.latent_dim}")
+    else:
+        print(f"WavVAE parameters: {count_parameters(model):,}")
+        print(f"  Encoder: {count_parameters(model.encoder):,}")
+        print(f"  Decoder: {count_parameters(model.decoder):,}")
+        print(f"  Total stride: {model.total_stride}")
 
     # ── Teacher / encoder freeze ─────────────────────────────
     teacher_ckpt_path = args.get("teacher_checkpoint", None)
     freeze_encoder = bool(args.get("freeze_encoder", False))
 
-    if teacher_ckpt_path and Path(teacher_ckpt_path).exists():
+    if is_v18:
+        # V18-specific loading paths for phoneme and decoder.
+        v18_phoneme_ckpt = str(args.get("v18_phoneme_checkpoint", ""))
+        v18_decoder_ckpt = str(args.get("v18_decoder_checkpoint", "")) or (
+            str(teacher_ckpt_path or "")
+        )
+        if v18_phoneme_ckpt and Path(v18_phoneme_ckpt).exists():
+            print(f"  Loading V18 phoneme pretrained: {v18_phoneme_ckpt}")
+            info = model.load_phoneme_pretrained(v18_phoneme_ckpt)
+            print(f"    {info}")
+        if v18_decoder_ckpt and Path(v18_decoder_ckpt).exists():
+            print(f"  Loading V18 decoder pretrained: {v18_decoder_ckpt}")
+            info = model.load_decoder_pretrained(v18_decoder_ckpt)
+            print(f"    {info}")
+    elif teacher_ckpt_path and str(teacher_ckpt_path) and Path(teacher_ckpt_path).exists():
         print(f"  Loading teacher checkpoint: {teacher_ckpt_path}")
         teacher_ckpt = torch.load(teacher_ckpt_path, map_location=device, weights_only=False)
         teacher_state = teacher_ckpt["model"]
@@ -763,15 +909,37 @@ def train(args: DictConfig) -> None:
                   f"{len(missing)} missing (new modules)")
 
     if freeze_encoder:
-        print("  Freezing encoder and bottleneck")
-        apply_freeze_policy(model, args)
-        # Also report the extra freezes that apply to this run.
-        if bool(args.get("use_phase_refiner", False)) and bool(args.get("freeze_decoder", True)):
-            print("  Freezing decoder (phase refiner only training)")
-        if bool(args.get("use_hybrid_decoder", False)) and bool(args.get("freeze_decoder_blocks", True)):
-            print("  Freezing decoder.proj + block0 (vocos head only training)")
-        if bool(args.get("use_dual_path_decoder", False)):
-            print("  Freezing time-domain path (vocos head only training)")
+        if is_v18:
+            # V18 freeze: freeze phoneme_encoder + residual_encoder + bottleneck
+            print("  Freezing V18 phoneme + residual encoders and bottleneck")
+            for p in model.phoneme_encoder.parameters():
+                p.requires_grad = False
+            for p in model.residual_encoder.parameters():
+                p.requires_grad = False
+            for p in model.bottleneck.parameters():
+                p.requires_grad = False
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Trainable parameters: {trainable:,}")
+        else:
+            print("  Freezing encoder and bottleneck")
+            apply_freeze_policy(model, args)
+            # Also report the extra freezes that apply to this run.
+            if bool(args.get("use_phase_refiner", False)) and bool(args.get("freeze_decoder", True)):
+                print("  Freezing decoder (phase refiner only training)")
+            if bool(args.get("use_hybrid_decoder", False)) and bool(args.get("freeze_decoder_blocks", True)):
+                print("  Freezing decoder.proj + block0 (vocos head only training)")
+            if bool(args.get("use_dual_path_decoder", False)):
+                print("  Freezing time-domain path (vocos head only training)")
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            print(f"  Trainable parameters: {trainable:,}")
+
+    # Optional V18-specific freeze: residual_encoder + decoder (for phoneme warmup)
+    if is_v18 and bool(args.get("v18_freeze_residual_and_decoder", False)):
+        print("  V18 phoneme warmup: freezing residual_encoder and decoder")
+        for p in model.residual_encoder.parameters():
+            p.requires_grad = False
+        for p in model.decoder.parameters():
+            p.requires_grad = False
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"  Trainable parameters: {trainable:,}")
 
@@ -920,7 +1088,7 @@ def train(args: DictConfig) -> None:
 
         # Load Phase 0 probe checkpoint if provided (warm start)
         _probe_ckpt_path = args.get("v17_4_probe_checkpoint", None)
-        if _probe_ckpt_path and Path(_probe_ckpt_path).exists():
+        if _probe_ckpt_path and str(_probe_ckpt_path) and Path(_probe_ckpt_path).exists():
             print(f"  Loading V17.4 probe checkpoint: {_probe_ckpt_path}")
             _probe_ckpt = torch.load(_probe_ckpt_path, map_location=device, weights_only=False)
             # Map probe state dict to V17.4 module state dict
@@ -1060,7 +1228,7 @@ def train(args: DictConfig) -> None:
             sr,
             total_stride,
             augment=augment,
-            return_metadata=v17_enable or v17_4_enable,
+            return_metadata=v17_enable or v17_4_enable or is_v18,
         )
 
         if segment_length == 0 and train_dataset._lengths is not None:
@@ -1089,7 +1257,7 @@ def train(args: DictConfig) -> None:
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
-                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
+                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable or is_v18) else collate_audio,
             )
         else:
             paired_sampler_enable = bool(args.get("paired_text_sampler", False))
@@ -1116,12 +1284,12 @@ def train(args: DictConfig) -> None:
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
                 drop_last=True,
-                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
+                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable or is_v18) else collate_audio,
             )
 
     eval_dataset = AudioDataset(
         args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
-        return_metadata=v17_enable or v17_4_enable,
+        return_metadata=v17_enable or v17_4_enable or is_v18,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -1130,7 +1298,7 @@ def train(args: DictConfig) -> None:
         num_workers=min(num_workers, 2),
         prefetch_factor=prefetch_factor if min(num_workers, 2) > 0 else None,
         pin_memory=True,
-        collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
+        collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable or is_v18) else collate_audio,
     )
 
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
@@ -1331,6 +1499,22 @@ def train(args: DictConfig) -> None:
                 )
                 recon_total_loss = recon_losses["total"]
                 g_loss = recon_total_loss
+
+                # ── V18 CTC loss on phoneme stream ─────────────────
+                v18_logs: dict[str, torch.Tensor] = {}
+                v18_ctc_loss = None
+                if is_v18 and metadata is not None and latent is None:
+                    lambda_phoneme = float(args.get("v18_lambda_phoneme", 0.3))
+                    if lambda_phoneme > 0:
+                        ctc_log_probs = out["ctc_log_probs"]  # [B, T, vocab]
+                        v18_ctc_loss, v18_logs = _compute_v18_ctc_loss(
+                            ctc_log_probs, metadata,
+                            vocab_size=int(args.get("v18_ctc_vocab_size", 512)),
+                            device=device,
+                        )
+                        if v18_ctc_loss is not None:
+                            g_loss = g_loss + lambda_phoneme * v18_ctc_loss
+
                 v17_logs = {}
                 v17_loss = None
                 if v17_constraints is not None and metadata is not None and latent is None:
@@ -1341,15 +1525,29 @@ def train(args: DictConfig) -> None:
                 v17_4_logs = {}
                 v17_4_loss = None
                 if v17_4_module is not None and metadata is not None and latent is None:
-                    v17_4_weight = float(args.get("v17_4_weight", 0.05))
-                    # Warmup: freeze encoder for first N steps
-                    v17_4_warmup = int(args.get("v17_4_warmup_steps", 2000))
-                    if global_step < v17_4_warmup:
+                    # Weight schedule: stay at 0 during recon warmup, then linearly ramp to target
+                    v17_4_target_weight = float(args.get("v17_4_weight", 0.05))
+                    v17_4_weight_warmup = int(args.get("v17_4_weight_warmup_steps", 0))
+                    v17_4_weight_ramp = int(args.get("v17_4_weight_ramp_steps", 0))
+                    if global_step < v17_4_weight_warmup:
+                        v17_4_current_weight = 0.0
+                    elif v17_4_weight_ramp > 0 and global_step < v17_4_weight_warmup + v17_4_weight_ramp:
+                        _progress = (global_step - v17_4_weight_warmup) / v17_4_weight_ramp
+                        v17_4_current_weight = v17_4_target_weight * _progress
+                    else:
+                        v17_4_current_weight = v17_4_target_weight
+
+                    # Legacy: if v17_4_warmup_steps set, freeze encoder for first N steps
+                    v17_4_step_warmup = int(args.get("v17_4_warmup_steps", 0))
+                    if v17_4_step_warmup > 0 and global_step < v17_4_step_warmup:
                         z_for_v174 = out["z"].detach()
                     else:
                         z_for_v174 = out["z"]
+
                     v17_4_loss, v17_4_logs = v17_4_module(z_for_v174, metadata)
-                    g_loss = g_loss + v17_4_weight * v17_4_loss
+                    if v17_4_current_weight > 0:
+                        g_loss = g_loss + v17_4_current_weight * v17_4_loss
+                    v17_4_logs["v174_weight"] = torch.tensor(v17_4_current_weight)
 
                 # Adversarial losses (Phase 2)
                 adv_g_loss_val = 0.0
@@ -1469,6 +1667,12 @@ def train(args: DictConfig) -> None:
                 )
                 if "mb_stft" in recon_losses:
                     msg += f" mb_stft={recon_losses['mb_stft'].item():.4f}"
+                if v18_logs:
+                    msg += (
+                        f" | v18_ctc={v18_logs['v18_ctc_loss'].item():.4f}"
+                        f"/nb={v18_logs['v18_ctc_non_blank_frac'].item():.2f}"
+                        f"/n={int(v18_logs['v18_ctc_n_valid'].item())}"
+                    )
                 if v17_logs:
                     msg += (
                         f" | v17={v17_logs['v17_total'].item():.4f}"
@@ -1534,6 +1738,8 @@ def train(args: DictConfig) -> None:
                         f" an={v17_4_logs['v174_analogy'].item():.4f}"
                         f" div={v17_4_logs['v174_diversity'].item():.4f}"
                     )
+                    if "v174_weight" in v17_4_logs:
+                        msg += f" w={v17_4_logs['v174_weight'].item():.4f}"
                     if "v174_analogy_cos" in v17_4_logs:
                         msg += f" acos={v17_4_logs['v174_analogy_cos'].item():.3f}"
                     if "v174_mean_cos" in v17_4_logs:
