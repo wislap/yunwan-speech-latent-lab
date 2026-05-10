@@ -156,8 +156,10 @@ class WavVAEEncoder(nn.Module):
         channels: Sequence[int] = (128, 256, 512, 1024),
         strides: Sequence[int] = (7, 7, 9),
         dilations: Sequence[int] = (1, 3, 9),
+        use_checkpoint: bool = False,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.stem = WNConv1d(1, channels[0], kernel_size=7, padding=3)
         self.blocks = nn.ModuleList([
             EncoderBlock(channels[i], channels[i + 1], strides[i], dilations)
@@ -168,7 +170,10 @@ class WavVAEEncoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.stem(x)
         for block in self.blocks:
-            h = block(h)
+            if self.use_checkpoint and self.training:
+                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
         return self.proj(h)
 
 
@@ -182,8 +187,10 @@ class WavVAEDecoder(nn.Module):
         channels: Sequence[int] = (1024, 512, 256, 128),
         strides: Sequence[int] = (9, 7, 7),
         dilations: Sequence[int] = (1, 3, 9),
+        use_checkpoint: bool = False,
     ):
         super().__init__()
+        self.use_checkpoint = use_checkpoint
         self.proj = WNConv1d(latent_dim, channels[0], kernel_size=7, padding=3)
         self.blocks = nn.ModuleList([
             DecoderBlock(channels[i], channels[i + 1], strides[i], dilations)
@@ -197,7 +204,10 @@ class WavVAEDecoder(nn.Module):
     def forward(self, z: torch.Tensor, output_length: int | None = None) -> torch.Tensor:
         h = self.proj(z)
         for block in self.blocks:
-            h = block(h)
+            if self.use_checkpoint and self.training:
+                h = torch.utils.checkpoint.checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
         x = self.tail(h)
         if output_length is not None:
             if x.shape[-1] > output_length:
@@ -789,6 +799,7 @@ class WavVAE(nn.Module):
         dual_vocos_layers: int = 6,
         dual_n_fft: int = 1024,
         dual_hop: int = 256,
+        use_checkpoint: bool = False,
     ):
         super().__init__()
         if decoder_channels is None:
@@ -799,6 +810,7 @@ class WavVAE(nn.Module):
             channels=encoder_channels,
             strides=strides,
             dilations=dilations,
+            use_checkpoint=use_checkpoint,
         )
 
         if use_dual_path_decoder:
@@ -853,6 +865,7 @@ class WavVAE(nn.Module):
                 channels=decoder_channels,
                 strides=list(reversed(strides)),
                 dilations=dilations,
+                use_checkpoint=use_checkpoint,
             )
 
         self.bottleneck = VAEBottleneck(

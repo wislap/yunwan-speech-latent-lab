@@ -1,0 +1,111 @@
+# V17.4 Phase 1: Joint AE + Flow Subspace + Analogy training.
+#
+# Initializes from V16.3 checkpoint. Trains:
+# - Full AE (encoder lr scaled down)
+# - SemanticProjection + FlowMatchingNet + ConditionEncoder
+#
+# Two structural constraints on z_proj:
+# 1. Flow matching: condition (text + speaker) predicts z_proj
+# 2. Analogy: speaker-change direction consistent across texts
+
+version_tag: v17_4_phase1_joint
+run_name: wav_vae_${.version_tag}_${runtime.site_tag}_${runtime.role_tag}
+
+train:
+  output_dir: ${runtime.project_root}/outputs/models/${experiment.run_name}
+  version_tag: v17_4_phase1_joint
+  data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_train_phalign_neighbors.jsonl
+  eval_data_path: ${runtime.project_root}/CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_val_phalign_neighbors.jsonl
+  teacher_checkpoint: ${runtime.project_root}/outputs/models/wav_vae_v16.3_256x_dim384_time_remote_main/best.pt
+
+  # AE architecture (matches V16.3)
+  latent_dim: 384
+  strides: [2, 4, 4, 8]
+  encoder_channels: [128, 256, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+
+  # VAE settings
+  sample_latent: false
+  reg_weight: 1.0e-4
+  margin_mean: 6.0
+  std_min: 0.05
+  std_max: 3.0
+  reg_warmup_steps: 5000
+
+  # Reconstruction losses
+  l1_time_weight: 10.0
+  l2_time_weight: 0.0
+  stft_weight: 0.5
+  mel_weight: 0.1
+  mb_stft_enable: false
+
+  # ── V17.4 Flow + Analogy constraint ──
+  v17_4_enable: true
+  v17_4_weight: 0.02    # Start small, can increase after warmup
+  # Warm-start from Phase 0 probe checkpoint (saves ~2000 warmup steps)
+  v17_4_probe_checkpoint: ${runtime.project_root}/outputs/models/v17_4_flow_probe_v5_spk_centered/best.pt
+  v17_4_proj_dim: 64
+  v17_4_proj_hidden_dim: 256
+  v17_4_proj_depth: 3
+  v17_4_flow_hidden_dim: 256
+  v17_4_flow_depth: 4
+  v17_4_cond_emb_dim: 128
+  v17_4_n_text_groups: 1024
+  v17_4_n_speakers: 16
+  v17_4_flow_weight: 1.0
+  v17_4_analogy_weight: 0.3
+  v17_4_diversity_weight: 0.5
+  v17_4_diversity_max_cos: 0.5
+  v17_4_analogy_min_cos: -0.3    # More permissive
+  v17_4_speaker_centroid_momentum: 0.99
+  # Warmup: first N steps only train projection+flow, encoder frozen
+  v17_4_warmup_steps: 500
+
+  # Disable old V17 constraints
+  v17_constraints_enable: false
+
+  # Training
+  use_checkpoint: true   # Gradient checkpointing: save ~50% activation memory
+  batch_size: 4
+  grad_accum_steps: 4
+  lr: 2.0e-5
+  lr_warmup_steps: 500
+  scheduler: cosine
+  grad_clip: 1.0
+  segment_length: 110080
+  epochs: 50
+  sr: 22050
+  augment: false
+
+  # Paired sampler for analogy loss
+  paired_text_sampler: true
+  paired_text_key: same_text_group
+
+  # No adversarial
+  adv_enable: false
+  adv_start_epoch: 999
+  adv_d_lr: 0
+  adv_g_weight: 0
+  adv_fm_weight: 0
+  freeze_encoder: false
+  freeze_decoder_blocks: false
+
+  # STFT/Mel configs
+  stft_fft_sizes: [512, 1024, 2048]
+  stft_hop_sizes: [128, 256, 512]
+  stft_win_sizes: [512, 1024, 2048]
+  mel_fft_sizes: [512, 1024, 2048]
+  mel_n_mels: [64, 128, 256]
+
+  # Discriminator (disabled)
+  disc_n_ffts: [256, 512, 1024]
+  disc_hop_lengths: [64, 128, 256]
+  disc_win_lengths: [256, 512, 1024]
+  disc_filters: 32
+
+  # Eval/logging
+  eval_every_epochs: 1
+  eval_batches: 4
+  log_interval: 50
+  num_workers: 2
+  prefetch_factor: 2

@@ -36,6 +36,7 @@ from autoencoder.models.discriminator import (
 )
 from autoencoder.models.discriminator_v14 import V14Discriminator
 from autoencoder.v17_constraints import V17ConstraintModule
+from autoencoder.v17_4_flow_structure import V174FlowStructureModule
 
 
 # ─── Dataset ─────────────────────────────────────────────────
@@ -717,6 +718,7 @@ def train(args: DictConfig) -> None:
         dual_vocos_layers=int(args.get("dual_vocos_layers", 6)),
         dual_n_fft=int(args.get("dual_n_fft", 1024)),
         dual_hop=int(args.get("dual_hop", 256)),
+        use_checkpoint=bool(args.get("use_checkpoint", False)),
     ).to(device)
 
     print(f"WavVAE parameters: {count_parameters(model):,}")
@@ -876,6 +878,89 @@ def train(args: DictConfig) -> None:
             f"params={count_parameters(v17_constraints):,}"
         )
 
+    # ── V17.4 flow + analogy constraint ───────────────────────
+    v17_4_enable = bool(args.get("v17_4_enable", False))
+    v17_4_module = None
+    if v17_4_enable:
+        # Build ID mappings from training data
+        _v174_data_path = Path(args.data_path)
+        _v174_eval_path = Path(args.get("eval_data_path", args.data_path))
+        _v174_all_items = []
+        for _p in [_v174_data_path, _v174_eval_path]:
+            if _p.exists() and _p.suffix in {".json", ".jsonl"}:
+                with open(_p, encoding="utf-8") as _f:
+                    if _p.suffix == ".jsonl":
+                        _v174_all_items.extend(json.loads(line) for line in _f if line.strip())
+                    else:
+                        _v174_all_items.extend(json.load(_f))
+        from autoencoder.v17_4_flow_structure import _text_key, _speaker_key
+        _v174_texts = sorted(set(_text_key(item) for item in _v174_all_items))
+        _v174_speakers = sorted(set(_speaker_key(item) for item in _v174_all_items))
+        _v174_text_to_id = {t: i for i, t in enumerate(_v174_texts)}
+        _v174_speaker_to_id = {s: i for i, s in enumerate(_v174_speakers)}
+
+        v17_4_module = V174FlowStructureModule(
+            latent_dim=int(args.latent_dim),
+            proj_dim=int(args.get("v17_4_proj_dim", 64)),
+            proj_hidden_dim=int(args.get("v17_4_proj_hidden_dim", 256)),
+            proj_depth=int(args.get("v17_4_proj_depth", 3)),
+            flow_hidden_dim=int(args.get("v17_4_flow_hidden_dim", 256)),
+            flow_depth=int(args.get("v17_4_flow_depth", 4)),
+            cond_emb_dim=int(args.get("v17_4_cond_emb_dim", 128)),
+            n_text_groups=len(_v174_texts) + 1,
+            n_speakers=len(_v174_speakers) + 1,
+            flow_weight=float(args.get("v17_4_flow_weight", 1.0)),
+            analogy_weight=float(args.get("v17_4_analogy_weight", 0.5)),
+            diversity_weight=float(args.get("v17_4_diversity_weight", 0.5)),
+            diversity_max_cos=float(args.get("v17_4_diversity_max_cos", 0.5)),
+            analogy_min_cos=float(args.get("v17_4_analogy_min_cos", 0.0)),
+            speaker_centroid_momentum=float(args.get("v17_4_speaker_centroid_momentum", 0.99)),
+        ).to(device)
+        v17_4_module.set_id_mappings(_v174_text_to_id, _v174_speaker_to_id)
+
+        # Load Phase 0 probe checkpoint if provided (warm start)
+        _probe_ckpt_path = args.get("v17_4_probe_checkpoint", None)
+        if _probe_ckpt_path and Path(_probe_ckpt_path).exists():
+            print(f"  Loading V17.4 probe checkpoint: {_probe_ckpt_path}")
+            _probe_ckpt = torch.load(_probe_ckpt_path, map_location=device, weights_only=False)
+            # Map probe state dict to V17.4 module state dict
+            # Probe has: semantic_proj, flow_net, cond_enc as separate modules
+            _probe_state = {}
+            for _k, _v in _probe_ckpt.get("semantic_proj", {}).items():
+                _probe_state[f"semantic_proj.{_k}"] = _v
+            for _k, _v in _probe_ckpt.get("flow_net", {}).items():
+                _probe_state[f"flow_net.{_k}"] = _v
+            for _k, _v in _probe_ckpt.get("cond_enc", {}).items():
+                # Probe uses different text/speaker count: use id mappings to re-map embeddings
+                if _k == "text_emb.weight":
+                    _probe_text_to_id = _probe_ckpt.get("text_to_id", {})
+                    _old_emb = _v
+                    _new_emb = v17_4_module.cond_enc.text_emb.weight.data.clone()
+                    for _text, _new_id in _v174_text_to_id.items():
+                        _old_id = _probe_text_to_id.get(_text)
+                        if _old_id is not None and _old_id < _old_emb.shape[0] and _new_id < _new_emb.shape[0]:
+                            _new_emb[_new_id] = _old_emb[_old_id]
+                    _probe_state[f"cond_enc.{_k}"] = _new_emb
+                elif _k == "speaker_emb.weight":
+                    _probe_speaker_to_id = _probe_ckpt.get("speaker_to_id", {})
+                    _old_emb = _v
+                    _new_emb = v17_4_module.cond_enc.speaker_emb.weight.data.clone()
+                    for _spk, _new_id in _v174_speaker_to_id.items():
+                        _old_id = _probe_speaker_to_id.get(_spk)
+                        if _old_id is not None and _old_id < _old_emb.shape[0] and _new_id < _new_emb.shape[0]:
+                            _new_emb[_new_id] = _old_emb[_old_id]
+                    _probe_state[f"cond_enc.{_k}"] = _new_emb
+                else:
+                    _probe_state[f"cond_enc.{_k}"] = _v
+            _missing, _unexpected = v17_4_module.load_state_dict(_probe_state, strict=False)
+            print(f"    Loaded {len(_probe_state)} keys, missing={len(_missing)}, unexpected={len(_unexpected)}")
+        print(
+            f"  V17.4 flow+analogy: weight={float(args.get('v17_4_weight', 0.05))}, "
+            f"proj_dim={int(args.get('v17_4_proj_dim', 64))}, "
+            f"texts={len(_v174_texts)}, speakers={len(_v174_speakers)}, "
+            f"params={count_parameters(v17_4_module):,}"
+        )
+
     # ── torch.compile ────────────────────────────────────────
     use_compile = bool(args.get("use_compile", False))
     if use_compile and hasattr(torch, "compile"):
@@ -975,7 +1060,7 @@ def train(args: DictConfig) -> None:
             sr,
             total_stride,
             augment=augment,
-            return_metadata=v17_enable,
+            return_metadata=v17_enable or v17_4_enable,
         )
 
         if segment_length == 0 and train_dataset._lengths is not None:
@@ -1004,7 +1089,7 @@ def train(args: DictConfig) -> None:
                 num_workers=num_workers,
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
-                collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
+                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
             )
         else:
             paired_sampler_enable = bool(args.get("paired_text_sampler", False))
@@ -1031,12 +1116,12 @@ def train(args: DictConfig) -> None:
                 prefetch_factor=prefetch_factor if num_workers > 0 else None,
                 pin_memory=True,
                 drop_last=True,
-                collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
+                collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
             )
 
     eval_dataset = AudioDataset(
         args.get("eval_data_path", args.data_path), segment_length, sr, total_stride,
-        return_metadata=v17_enable,
+        return_metadata=v17_enable or v17_4_enable,
     )
     eval_loader = DataLoader(
         eval_dataset,
@@ -1045,7 +1130,7 @@ def train(args: DictConfig) -> None:
         num_workers=min(num_workers, 2),
         prefetch_factor=prefetch_factor if min(num_workers, 2) > 0 else None,
         pin_memory=True,
-        collate_fn=collate_audio_with_metadata if v17_enable else collate_audio,
+        collate_fn=collate_audio_with_metadata if (v17_enable or v17_4_enable) else collate_audio,
     )
 
     print(f"Train samples: {len(train_dataset)}, Eval samples: {len(eval_dataset)}")
@@ -1054,6 +1139,8 @@ def train(args: DictConfig) -> None:
     g_params = list(model.parameters())
     if v17_constraints is not None:
         g_params += list(v17_constraints.parameters())
+    if v17_4_module is not None:
+        g_params += list(v17_4_module.parameters())
     g_optimizer = torch.optim.AdamW(g_params, lr=float(args.lr), betas=(0.8, 0.99))
     d_optimizer = None
     if disc is not None:
@@ -1095,6 +1182,8 @@ def train(args: DictConfig) -> None:
             subband_disc.load_state_dict(ckpt["subband_disc"])
         if v17_constraints is not None and "v17_constraints" in ckpt:
             v17_constraints.load_state_dict(ckpt["v17_constraints"])
+        if v17_4_module is not None and "v17_4_module" in ckpt:
+            v17_4_module.load_state_dict(ckpt["v17_4_module"])
         if d_optimizer is not None and "d_optimizer" in ckpt:
             d_optimizer.load_state_dict(ckpt["d_optimizer"])
         start_epoch = ckpt.get("epoch", 0) + 1
@@ -1155,6 +1244,8 @@ def train(args: DictConfig) -> None:
         model.train()
         if v17_constraints is not None:
             v17_constraints.train()
+        if v17_4_module is not None:
+            v17_4_module.train()
         if disc is not None:
             disc.train()
         if subband_disc is not None:
@@ -1245,6 +1336,20 @@ def train(args: DictConfig) -> None:
                 if v17_constraints is not None and metadata is not None and latent is None:
                     v17_loss, v17_logs = v17_constraints(out["z"], metadata, audio=audio)
                     g_loss = g_loss + v17_loss
+
+                # V17.4 flow + analogy constraint
+                v17_4_logs = {}
+                v17_4_loss = None
+                if v17_4_module is not None and metadata is not None and latent is None:
+                    v17_4_weight = float(args.get("v17_4_weight", 0.05))
+                    # Warmup: freeze encoder for first N steps
+                    v17_4_warmup = int(args.get("v17_4_warmup_steps", 2000))
+                    if global_step < v17_4_warmup:
+                        z_for_v174 = out["z"].detach()
+                    else:
+                        z_for_v174 = out["z"]
+                    v17_4_loss, v17_4_logs = v17_4_module(z_for_v174, metadata)
+                    g_loss = g_loss + v17_4_weight * v17_4_loss
 
                 # Adversarial losses (Phase 2)
                 adv_g_loss_val = 0.0
@@ -1422,6 +1527,17 @@ def train(args: DictConfig) -> None:
                     msg += f" | adv_g={adv_g_loss_val:.4f} fm={fm_loss_val:.4f} D={d_loss_val:.4f}"
                     if sb_adv_g_val > 0:
                         msg += f" sb_g={sb_adv_g_val:.4f}"
+                if v17_4_logs:
+                    msg += (
+                        f" | v174={v17_4_logs['v174_total'].item():.4f}"
+                        f" fl={v17_4_logs['v174_flow'].item():.4f}"
+                        f" an={v17_4_logs['v174_analogy'].item():.4f}"
+                        f" div={v17_4_logs['v174_diversity'].item():.4f}"
+                    )
+                    if "v174_analogy_cos" in v17_4_logs:
+                        msg += f" acos={v17_4_logs['v174_analogy_cos'].item():.3f}"
+                    if "v174_mean_cos" in v17_4_logs:
+                        msg += f" mcos={v17_4_logs['v174_mean_cos'].item():.3f}"
                 msg += f" | lr={lr_g:.2e}"
                 print(msg, flush=True)
 
@@ -1468,6 +1584,8 @@ def train(args: DictConfig) -> None:
                 }
                 if v17_constraints is not None:
                     save_dict["v17_constraints"] = v17_constraints.state_dict()
+                if v17_4_module is not None:
+                    save_dict["v17_4_module"] = v17_4_module.state_dict()
                 safe_save(save_dict, output_dir / "best.pt")
                 print(f"  New best SNR: {best_snr:.2f}dB")
 
@@ -1488,6 +1606,8 @@ def train(args: DictConfig) -> None:
             save_dict["subband_disc"] = subband_disc.state_dict()
         if v17_constraints is not None:
             save_dict["v17_constraints"] = v17_constraints.state_dict()
+        if v17_4_module is not None:
+            save_dict["v17_4_module"] = v17_4_module.state_dict()
         if d_optimizer is not None:
             save_dict["d_optimizer"] = d_optimizer.state_dict()
         if d_scheduler is not None:
