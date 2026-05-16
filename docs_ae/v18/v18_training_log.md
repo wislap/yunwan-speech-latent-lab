@@ -122,9 +122,18 @@ show the decomposition works. The failure modes are:
 - CTC loss alone cannot produce speaker invariance without additional
   gradient reversal or MI constraints
 
-### Next steps
+### Status: archived (2026-05-16)
 
-V18.0.1 ablations to run before declaring V18 core dead:
+V18 stops here. The run is reframed as a stress-test of V16.3 bottleneck +
+loss recipe under additional supervision, not as a product line. See
+[lessons.md](lessons.md) for the consolidated takeaways. Next work moves to
+the FM-DiT side (`../../fm_dit/`).
+
+### Ablations considered but not run
+
+The following V18.0.1 ablations were planned but skipped after the gate
+result. Marginal information value is low relative to the cost; the V18
+result already supports the conclusions in lessons.md.
 
 1. **lambda_phoneme = 0.0**: pure recon under V18 architecture. Is SNR
    ~ V16.3's 20.7 dB? If yes, the architecture is fine and CTC is the

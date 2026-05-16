@@ -1,0 +1,529 @@
+{
+  "block": "B2",
+  "checkpoint": "outputs/models/wav_vae_v16.3_256x_dim384_time_remote_main/best.pt",
+  "checkpoint_epoch": 13,
+  "checkpoint_best_snr": 20.732428689374803,
+  "dataset_name": "cosyvoice_4spk_val",
+  "manifest": "CosyVoice_main/outputs/tts/cosyvoice3/crossed_zh_4spk_4h_scale_v0_4spk_qc_8p0_13p5_val_phalign_neighbors.jsonl",
+  "n_samples_requested": 112,
+  "n_samples_encoded": 112,
+  "n_frames_total": 57344,
+  "latent_dim": 384,
+  "k_directions": 32,
+  "n_folds": 5,
+  "seed": 20260510,
+  "phoneme_vocab_size": 283,
+  "phoneme_labeled_frames": 57344,
+  "phoneme_unique_classes": 80,
+  "n_speakers": 4,
+  "assignment_thresholds": {
+    "phoneme": 0.3,
+    "speaker": 0.3,
+    "f0": 0.3,
+    "energy": 0.3,
+    "centroid": 0.3,
+    "voiced": 0.3
+  },
+  "primary_counts": {
+    "phoneme": 0,
+    "speaker": 0,
+    "f0": 0,
+    "energy": 0,
+    "centroid": 0,
+    "voiced": 0,
+    "unassigned": 32
+  },
+  "max_score_per_label": {
+    "phoneme": 0.0032857584730399173,
+    "speaker": 0.013342662510490993,
+    "f0": -0.05731646155090282,
+    "energy": 0.061340655867684134,
+    "centroid": 0.021110682858560593,
+    "voiced": 0.01176744537323211
+  },
+  "ev_top32": [
+    0.0700688945186848,
+    0.05869842013898442,
+    0.039426984044907624,
+    0.03468918098231869,
+    0.02831737628312737,
+    0.02757850318423488,
+    0.02517375911701664,
+    0.02342709779669126,
+    0.01910033431696089,
+    0.01747308780583498,
+    0.014321908304402579,
+    0.013827727268341373,
+    0.01298506740572137,
+    0.012144434259845864,
+    0.01154084407131723,
+    0.011375955558492874,
+    0.01077944290447092,
+    0.010048307316798098,
+    0.009842739098714253,
+    0.009451151916385405,
+    0.009277774769963698,
+    0.0088408562102131,
+    0.00858104107213683,
+    0.008523759573501015,
+    0.008421719042460373,
+    0.008310169826779632,
+    0.008118298198503989,
+    0.008032663634306972,
+    0.0076620161349281865,
+    0.007427523811657555,
+    0.007269968304686697,
+    0.006998459346786602
+  ],
+  "ev_top32_sum": 0.5577354662191761,
+  "per_direction": [
+    {
+      "component": 0,
+      "explained_variance_ratio": 0.0700688945186848,
+      "scores": {
+        "phoneme": 0.000721071588597764,
+        "speaker": 7.814613739997463e-06,
+        "f0": -0.06239515361038066,
+        "energy": -0.02164727493180827,
+        "centroid": -0.0015263906239719738,
+        "voiced": -0.0009897143645472895
+      },
+      "primary": "unassigned",
+      "primary_score": 0.000721071588597764
+    },
+    {
+      "component": 1,
+      "explained_variance_ratio": 0.05869842013898442,
+      "scores": {
+        "phoneme": 0.0007390029318818956,
+        "speaker": 0.00011200266537677279,
+        "f0": -0.062392749381812475,
+        "energy": -0.021384285667794954,
+        "centroid": -0.001576203659516473,
+        "voiced": -0.0010260680651922095
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0007390029318818956
+    },
+    {
+      "component": 2,
+      "explained_variance_ratio": 0.039426984044907624,
+      "scores": {
+        "phoneme": 0.0020541695513949985,
+        "speaker": 0.0004768078926808395,
+        "f0": -0.062357693147970086,
+        "energy": -0.020948651174868882,
+        "centroid": -0.0012867029455714495,
+        "voiced": -0.0009080248328581231
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0020541695513949985
+    },
+    {
+      "component": 3,
+      "explained_variance_ratio": 0.03468918098231869,
+      "scores": {
+        "phoneme": 0.0029879958372737475,
+        "speaker": 8.00593824090487e-05,
+        "f0": -0.06243661637098028,
+        "energy": -0.021907117099538943,
+        "centroid": -0.0016083202544848075,
+        "voiced": -0.0010709670478549426
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0029879958372737475
+    },
+    {
+      "component": 4,
+      "explained_variance_ratio": 0.02831737628312737,
+      "scores": {
+        "phoneme": 0.001268887510803438,
+        "speaker": 0.0001823021794195223,
+        "f0": -0.06228675150948333,
+        "energy": -0.021692210113181787,
+        "centroid": -0.0015998015600691585,
+        "voiced": -0.0010390641366830877
+      },
+      "primary": "unassigned",
+      "primary_score": 0.001268887510803438
+    },
+    {
+      "component": 5,
+      "explained_variance_ratio": 0.02757850318423488,
+      "scores": {
+        "phoneme": 0.0015643841184977492,
+        "speaker": 1.6098802382858273e-05,
+        "f0": -0.06247276564615567,
+        "energy": -0.02182110977765599,
+        "centroid": -0.0015555245003984197,
+        "voiced": -0.0010276733866465548
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0015643841184977492
+    },
+    {
+      "component": 6,
+      "explained_variance_ratio": 0.02517375911701664,
+      "scores": {
+        "phoneme": 0.0015632106371489753,
+        "speaker": 0.000146176080339289,
+        "f0": -0.06239611929290127,
+        "energy": -0.020098290172484747,
+        "centroid": -0.0016059293975820843,
+        "voiced": -0.0010205994210298551
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0015632106371489753
+    },
+    {
+      "component": 7,
+      "explained_variance_ratio": 0.02342709779669126,
+      "scores": {
+        "phoneme": 0.0018995866594943088,
+        "speaker": 0.000231253046685133,
+        "f0": -0.062404847501066785,
+        "energy": -0.019978044171898236,
+        "centroid": -0.0013302126970236917,
+        "voiced": -0.0007888130541240601
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0018995866594943088
+    },
+    {
+      "component": 8,
+      "explained_variance_ratio": 0.01910033431696089,
+      "scores": {
+        "phoneme": 0.0013765108577399525,
+        "speaker": 2.713143562153188e-05,
+        "f0": -0.06241142165671589,
+        "energy": -0.021686792880279172,
+        "centroid": -0.0015958332025102439,
+        "voiced": -0.0010307767806637003
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0013765108577399525
+    },
+    {
+      "component": 9,
+      "explained_variance_ratio": 0.01747308780583498,
+      "scores": {
+        "phoneme": 0.002057706722235496,
+        "speaker": 5.227012071098843e-05,
+        "f0": -0.06240850037773833,
+        "energy": -0.021743007521687518,
+        "centroid": -0.001467914272471127,
+        "voiced": -0.0010016681053249155
+      },
+      "primary": "unassigned",
+      "primary_score": 0.002057706722235496
+    },
+    {
+      "component": 10,
+      "explained_variance_ratio": 0.014321908304402579,
+      "scores": {
+        "phoneme": 0.0015011079178793231,
+        "speaker": 0.0004468163700982467,
+        "f0": -0.06229610999841153,
+        "energy": -0.017480552301146667,
+        "centroid": -0.00042288339780627293,
+        "voiced": -0.000494310537989362
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0015011079178793231
+    },
+    {
+      "component": 11,
+      "explained_variance_ratio": 0.013827727268341373,
+      "scores": {
+        "phoneme": 0.001774238143562137,
+        "speaker": 0.0002178466226950967,
+        "f0": -0.062370392179065745,
+        "energy": -0.02102688812960247,
+        "centroid": -0.0015247586395351399,
+        "voiced": -0.0009649666450761262
+      },
+      "primary": "unassigned",
+      "primary_score": 0.001774238143562137
+    },
+    {
+      "component": 12,
+      "explained_variance_ratio": 0.01298506740572137,
+      "scores": {
+        "phoneme": 0.00125678609439374,
+        "speaker": 0.0007372060061054538,
+        "f0": -0.06223029693775191,
+        "energy": -0.02028330308268598,
+        "centroid": -0.0012355537352340962,
+        "voiced": -0.000897455614891074
+      },
+      "primary": "unassigned",
+      "primary_score": 0.00125678609439374
+    },
+    {
+      "component": 13,
+      "explained_variance_ratio": 0.012144434259845864,
+      "scores": {
+        "phoneme": 0.0014950352995633147,
+        "speaker": 0.0002611773196918114,
+        "f0": -0.06239533583742678,
+        "energy": -0.020826907953406516,
+        "centroid": -0.0014244683578617412,
+        "voiced": -0.0008728302445578873
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0014950352995633147
+    },
+    {
+      "component": 14,
+      "explained_variance_ratio": 0.01154084407131723,
+      "scores": {
+        "phoneme": 0.0012936304705675361,
+        "speaker": 0.0006439157766722362,
+        "f0": -0.06242542097535453,
+        "energy": -0.019345569915680504,
+        "centroid": -0.0011211084392030112,
+        "voiced": -0.0006122872572876803
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0012936304705675361
+    },
+    {
+      "component": 15,
+      "explained_variance_ratio": 0.011375955558492874,
+      "scores": {
+        "phoneme": 0.0017922600774910144,
+        "speaker": 0.00120856788603395,
+        "f0": -0.062206317921131314,
+        "energy": -0.013272866262737205,
+        "centroid": 0.00031312922370745343,
+        "voiced": 0.00023638128776599655
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0017922600774910144
+    },
+    {
+      "component": 16,
+      "explained_variance_ratio": 0.01077944290447092,
+      "scores": {
+        "phoneme": 0.0024357984047869686,
+        "speaker": 0.001183021748666982,
+        "f0": -0.06225928154235629,
+        "energy": -0.012479703652097362,
+        "centroid": 0.001451326238840789,
+        "voiced": 3.701809734313333e-05
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0024357984047869686
+    },
+    {
+      "component": 17,
+      "explained_variance_ratio": 0.010048307316798098,
+      "scores": {
+        "phoneme": 0.0032857584730399173,
+        "speaker": 0.011841732522414362,
+        "f0": -0.060443405894098134,
+        "energy": 0.061340655867684134,
+        "centroid": 0.010582406718603221,
+        "voiced": 0.007100845417190427
+      },
+      "primary": "unassigned",
+      "primary_score": 0.061340655867684134
+    },
+    {
+      "component": 18,
+      "explained_variance_ratio": 0.009842739098714253,
+      "scores": {
+        "phoneme": 0.0019731062844623695,
+        "speaker": 0.0040385074646241,
+        "f0": -0.06244975127392398,
+        "energy": 0.0063308877025666675,
+        "centroid": 0.001805668875175126,
+        "voiced": 0.000992808841922832
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0063308877025666675
+    },
+    {
+      "component": 19,
+      "explained_variance_ratio": 0.009451151916385405,
+      "scores": {
+        "phoneme": 0.0020360512383583197,
+        "speaker": 0.002508364393781747,
+        "f0": -0.062411120792514874,
+        "energy": -0.004327114268398424,
+        "centroid": -0.0013020510043344924,
+        "voiced": -0.0002911745502446328
+      },
+      "primary": "unassigned",
+      "primary_score": 0.002508364393781747
+    },
+    {
+      "component": 20,
+      "explained_variance_ratio": 0.009277774769963698,
+      "scores": {
+        "phoneme": 0.001812989855090446,
+        "speaker": 0.0003013898902734187,
+        "f0": -0.0624136718907049,
+        "energy": -0.017818608766203826,
+        "centroid": -2.970529656951548e-05,
+        "voiced": -0.00011239380231171658
+      },
+      "primary": "unassigned",
+      "primary_score": 0.001812989855090446
+    },
+    {
+      "component": 21,
+      "explained_variance_ratio": 0.0088408562102131,
+      "scores": {
+        "phoneme": 0.0014878215315135529,
+        "speaker": 0.0008882986385274007,
+        "f0": -0.062360955315385345,
+        "energy": -0.016106604731713946,
+        "centroid": -0.0012385508829010794,
+        "voiced": -0.0009548125013767895
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0014878215315135529
+    },
+    {
+      "component": 22,
+      "explained_variance_ratio": 0.00858104107213683,
+      "scores": {
+        "phoneme": 0.0021872989886567297,
+        "speaker": 0.010237705840935151,
+        "f0": -0.05731646155090282,
+        "energy": 0.02428621901634509,
+        "centroid": 0.018189204685603987,
+        "voiced": 0.009698421840630056
+      },
+      "primary": "unassigned",
+      "primary_score": 0.02428621901634509
+    },
+    {
+      "component": 23,
+      "explained_variance_ratio": 0.008523759573501015,
+      "scores": {
+        "phoneme": 0.0028472921203449653,
+        "speaker": 0.013342662510490993,
+        "f0": -0.05873747694015659,
+        "energy": 0.03679770708007566,
+        "centroid": 0.021110682858560593,
+        "voiced": 0.01176744537323211
+      },
+      "primary": "unassigned",
+      "primary_score": 0.03679770708007566
+    },
+    {
+      "component": 24,
+      "explained_variance_ratio": 0.008421719042460373,
+      "scores": {
+        "phoneme": 0.0022414374517699164,
+        "speaker": 0.0030181028755800433,
+        "f0": -0.06147234511218387,
+        "energy": -0.008599216923421315,
+        "centroid": 0.012629143837913737,
+        "voiced": 0.003719521308943241
+      },
+      "primary": "unassigned",
+      "primary_score": 0.012629143837913737
+    },
+    {
+      "component": 25,
+      "explained_variance_ratio": 0.008310169826779632,
+      "scores": {
+        "phoneme": 0.0015584823110566717,
+        "speaker": 0.0006851967468772885,
+        "f0": -0.06219345332393167,
+        "energy": -0.018105751073538113,
+        "centroid": -0.0011830205056693633,
+        "voiced": -0.0007760807566858929
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0015584823110566717
+    },
+    {
+      "component": 26,
+      "explained_variance_ratio": 0.008118298198503989,
+      "scores": {
+        "phoneme": 0.001430194372368883,
+        "speaker": 0.0005611037495416996,
+        "f0": -0.062415361858675265,
+        "energy": -0.01660719784804483,
+        "centroid": -0.0013341013331618745,
+        "voiced": -0.0004687402267694152
+      },
+      "primary": "unassigned",
+      "primary_score": 0.001430194372368883
+    },
+    {
+      "component": 27,
+      "explained_variance_ratio": 0.008032663634306972,
+      "scores": {
+        "phoneme": 0.0012678885592879079,
+        "speaker": 0.00017747213084846016,
+        "f0": -0.062473624725626696,
+        "energy": -0.020628790716800037,
+        "centroid": -0.0010452356290420628,
+        "voiced": -0.0005758627762038948
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0012678885592879079
+    },
+    {
+      "component": 28,
+      "explained_variance_ratio": 0.0076620161349281865,
+      "scores": {
+        "phoneme": 0.002293895773424128,
+        "speaker": 0.0074858770620610925,
+        "f0": -0.06169320138089773,
+        "energy": 0.017580930630780457,
+        "centroid": 0.01038811459923008,
+        "voiced": 0.005384687164184276
+      },
+      "primary": "unassigned",
+      "primary_score": 0.017580930630780457
+    },
+    {
+      "component": 29,
+      "explained_variance_ratio": 0.007427523811657555,
+      "scores": {
+        "phoneme": 0.001488569436262126,
+        "speaker": 0.0014672345474980154,
+        "f0": -0.062341707312733655,
+        "energy": -0.020485304978301633,
+        "centroid": -0.0012879207192202369,
+        "voiced": -0.0010354181333243507
+      },
+      "primary": "unassigned",
+      "primary_score": 0.001488569436262126
+    },
+    {
+      "component": 30,
+      "explained_variance_ratio": 0.007269968304686697,
+      "scores": {
+        "phoneme": 0.0013457665042603082,
+        "speaker": 0.0012553602406925365,
+        "f0": -0.06238114012625342,
+        "energy": -0.014486217131407918,
+        "centroid": -0.0013190389529734946,
+        "voiced": -0.0007615818961206333
+      },
+      "primary": "unassigned",
+      "primary_score": 0.0013457665042603082
+    },
+    {
+      "component": 31,
+      "explained_variance_ratio": 0.006998459346786602,
+      "scores": {
+        "phoneme": 0.002116529403910068,
+        "speaker": 0.001574045290759961,
+        "f0": -0.061827503317713604,
+        "energy": -0.01728316172491786,
+        "centroid": -0.00038136927769623076,
+        "voiced": -0.0006550301081265531
+      },
+      "primary": "unassigned",
+      "primary_score": 0.002116529403910068
+    }
+  ]
+}
