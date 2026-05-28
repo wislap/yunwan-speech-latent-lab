@@ -1,0 +1,58 @@
+# V19: Generation-Friendly Latent - Phase 1 Smoke Test
+#
+# Goal:
+#   Validate the masked latent prediction pipeline on LJSpeech with low-pass filtering.
+#   Uses V16.3 architecture unchanged, only training recipe differs.
+#
+# Launch:
+#   python -m autoencoder.train_gen_friendly --config autoencoder/conf/experiment/v19_gen_friendly_phase1.yaml
+
+# Pretrained AE (V16.3 checkpoint)
+pretrained_ae_path: null  # Set to V16.3 best.pt path on server
+
+model:
+  latent_dim: 384
+  strides: [2, 4, 4, 8]
+  encoder_channels: [128, 256, 512, 1024, 1024]
+  dilations: [1, 3, 9]
+  sample_latent: false
+  reg_weight: 1.0e-4
+  total_stride: 256
+
+predictor:
+  hidden_dim: 512
+  n_heads: 8
+  n_layers: 6
+  phoneme_vocab_size: 512
+  max_seq_len: 4096
+  dropout: 0.1
+
+data:
+  train_manifest: null  # Set to data JSONL path
+  sr: 22050
+  lpf_cutoff_hz: 4000.0
+  path_root: null
+
+masking:
+  mask_ratio: 0.6
+  min_block_frames: 50   # ~2.9s at 86fps (for segment_length=65536 → 256 frames)
+  max_block_frames: 150  # ~8.7s at 86fps
+
+training:
+  batch_size: 1
+  grad_accum_steps: 16
+  segment_length: 65536
+  ae_lr: 1.0e-4
+  predictor_lr: 5.0e-4
+  weight_decay: 0.01
+  epochs: 30
+  phase1_epochs: 30
+  phase2_epochs: 0
+  phase3_epochs: 0
+  log_interval: 10
+  eval_interval: 100
+  save_interval: 500
+  num_workers: 4
+  smooth_initial_weight: 1.0e-5
+  smooth_max_weight: 1.0e-3
+  output_dir: outputs/models/v19_gen_friendly_phase1_smoke
